@@ -609,37 +609,6 @@ def append_video_params(video_url: str, parent_id: str = "", child_id: str = "",
 
 
 # ===============================================================
-# NEW FEATURE: Extract Thumbnail URL (image) for a video
-# Thumbnail lives at videoDetails.image (e.g. https://static.pw.live/.../ADMIN/xxx.png)
-# Used to append "||thumbnail_url" after the video URL in exported txt files.
-# Does NOT touch any existing video-url extraction logic.
-# ===============================================================
-def extract_thumbnail_url(video_details: dict) -> str:
-    """Extract the thumbnail (image) URL for a video from its videoDetails dict.
-    Returns '' if not found so callers can safely skip appending '||'."""
-    if not video_details or not isinstance(video_details, dict):
-        return ""
-
-    thumb = video_details.get("image", "") or video_details.get("thumbnail", "") or video_details.get("thumbnailUrl", "")
-
-    if thumb and isinstance(thumb, str) and thumb.startswith("http"):
-        lower = thumb.lower()
-        if ".png" in lower or ".jpg" in lower or ".jpeg" in lower or ".webp" in lower:
-            return thumb
-
-    return ""
-
-
-def with_thumbnail(video_url_line: str, thumb_url: str) -> str:
-    """Append '||thumbnail_url' to an already-built 'Title:VideoURL...' line,
-    without any spaces around '||'. If no thumbnail is available, returns the
-    line unchanged (old format preserved)."""
-    if thumb_url:
-        return f"{video_url_line}||{thumb_url}"
-    return video_url_line
-
-
-# ===============================================================
 # COMPREHENSIVE: Extract video URL from ALL PW API response formats
 # ===============================================================
 def extract_comprehensive_video_url(video_details: dict, parent_id: str = "", child_id: str = "", video_id: str = "") -> Tuple[str, str]:
@@ -2184,6 +2153,55 @@ async def fetch_content_via_schedule_details(
     all_lines = []
     dedup = ContentDeduplicator()
 
+    # === PRIMARY FIX: For notes/DppNotes, try new batch-service v3 endpoint FIRST ===
+    # This endpoint returns full baseUrl+key directly without needing schedule-details
+    if content_type in ('notes', 'DppNotes'):
+        try:
+            v3_content_type = "NOTES" if content_type == 'notes' else "DPP_PDF"
+            new_ep_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{batch_id}/subject/{subject_id}/contents"
+            web_headers = dict(headers)
+            web_headers["client-type"] = "WEB"
+            web_headers["X-SDK-Version"] = "0.0.28"
+            web_headers["client-version"] = "5.2.16"
+
+            skip = 0
+            while True:
+                new_ep_params = {
+                    "skip": skip,
+                    "limit": 20,
+                    "contentType": v3_content_type,
+                    "contentFilter": "ALL",
+                    "tagId": topic_id
+                }
+                new_data = await fetch_pwwp_data(session, new_ep_url, headers=web_headers, params=new_ep_params)
+                if not new_data or not new_data.get("data"):
+                    break
+                items_v3 = new_data["data"]
+                if not items_v3:
+                    break
+                for new_item in items_v3:
+                    item_data = new_item.get("data", {})
+                    hw_list = item_data.get("homeworkIds", [])
+                    for hw in hw_list:
+                        hw_topic = safe_topic(hw.get("topic"), "Unknown Topic")
+                        for att in hw.get("attachmentIds", []):
+                            base_url = att.get("baseUrl", "")
+                            key = att.get("key", "")
+                            name = safe_topic(att.get("name"), hw_topic)
+                            if base_url and key:
+                                line = f"{name}:{base_url}{key}"
+                                if dedup.add_and_check_unique(line):
+                                    all_lines.append(line)
+                if len(items_v3) < 20:
+                    break
+                skip += 20
+        except Exception as e_v3:
+            logging.warning(f"Primary batch-service v3 {content_type} fetch failed: {e_v3}")
+
+        # If we got results from v3, return them directly — no need for old endpoint
+        if all_lines:
+            return all_lines
+
     try:
         page = 1
         while page <= 20:  # safety limit
@@ -2210,7 +2228,8 @@ async def fetch_content_via_schedule_details(
                 got_content = False
 
                 # Try schedule-details for PROPER video URL extraction
-                detail_url = f"https://api.penpencil.co/v3/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+                # FIXED: v3 silently fails for notes — use v1 (confirmed working)
+                detail_url = f"https://api.penpencil.co/v1/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
                 detail_data = await fetch_pwwp_data(session, detail_url, headers=headers)
 
                 if detail_data and detail_data.get("data"):
@@ -2231,8 +2250,7 @@ async def fetch_content_via_schedule_details(
                         # Method 1: Comprehensive extractor (PRIMARY - always with IDs)
                         vurl, drm = extract_comprehensive_video_url(video_details, parent_id, child_id, vid)
                         if vurl:
-                            thumb_url = extract_thumbnail_url(video_details)
-                            line = with_thumbnail(f"{topic}:{vurl}{drm}", thumb_url)
+                            line = f"{topic}:{vurl}{drm}"
                             if dedup.add_and_check_unique(line):
                                 all_lines.append(line)
                                 got_content = True
@@ -2242,9 +2260,7 @@ async def fetch_content_via_schedule_details(
                             video_info = extract_video_data_from_schedule(detail_data)
                             # Pass IDs to format_video_line as well
                             video_lines = format_video_line(topic, video_info, parent_id, child_id, vid)
-                            thumb_url = extract_thumbnail_url(video_details)
                             for vline in video_lines:
-                                vline = with_thumbnail(vline, thumb_url)
                                 if dedup.add_and_check_unique(vline):
                                     all_lines.append(vline)
                                     got_content = True
@@ -2296,8 +2312,7 @@ async def fetch_content_via_schedule_details(
                             child_id_fb = schedule_id
                             vid_fb = item.get('videoId', '') or item.get('contentId', '')
                             vurl = append_video_params(vurl, parent_id_fb, child_id_fb, vid_fb)
-                            thumb_url = extract_thumbnail_url(item.get('videoDetails', {}))
-                            line = with_thumbnail(f"{topic}:{vurl}{drm}", thumb_url)
+                            line = f"{topic}:{vurl}{drm}"
                             if dedup.add_and_check_unique(line):
                                 all_lines.append(line)
                                 got_content = True
@@ -2310,37 +2325,107 @@ async def fetch_content_via_schedule_details(
                                 child_id_fb = schedule_id
                                 vid_fb = item.get('videoId', '') or item.get('contentId', '')
                                 final_url = append_video_params(basic_url, parent_id_fb, child_id_fb, vid_fb)
-                                thumb_url = extract_thumbnail_url(item.get('videoDetails', {}))
-                                line = with_thumbnail(f"{topic}:{final_url}", thumb_url)
+                                line = f"{topic}:{final_url}"
                                 if dedup.add_and_check_unique(line):
                                     all_lines.append(line)
                                     got_content = True
 
                     elif content_type == 'notes':
-                        for hw in item.get('homeworkIds', []):
-                            for att in hw.get('attachmentIds', []):
-                                name = safe_topic(att.get('name'), topic)
-                                base_url = att.get('baseUrl', '')
-                                key = att.get('key', '')
-                                if key:
-                                    line = f"{name}:{base_url}{key}"
-                                    if dedup.add_and_check_unique(line):
-                                        all_lines.append(line)
-                                        got_content = True
+                        # FIXED: Try new batch-service v3 endpoint for this schedule item
+                        # which returns full baseUrl+key directly (no schedule-details needed)
+                        try:
+                            new_ep_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{batch_id}/subject/{subject_id}/contents"
+                            new_ep_params = {
+                                "skip": 0,
+                                "limit": 20,
+                                "contentType": "NOTES",
+                                "contentFilter": "ALL",
+                                "tagId": topic_id
+                            }
+                            web_headers = dict(headers)
+                            web_headers["client-type"] = "WEB"
+                            web_headers["X-SDK-Version"] = "0.0.28"
+                            web_headers["client-version"] = "5.2.15"
+                            new_data = await fetch_pwwp_data(session, new_ep_url, headers=web_headers, params=new_ep_params)
+                            if new_data and new_data.get("data"):
+                                for new_item in new_data["data"]:
+                                    item_data = new_item.get("data", {})
+                                    hw_list = item_data.get("homeworkIds", [])
+                                    for hw in hw_list:
+                                        hw_topic = safe_topic(hw.get("topic"), topic)
+                                        for att in hw.get("attachmentIds", []):
+                                            base_url = att.get("baseUrl", "")
+                                            key = att.get("key", "")
+                                            name = safe_topic(att.get("name"), hw_topic)
+                                            if base_url and key:
+                                                line = f"{name}:{base_url}{key}"
+                                                if dedup.add_and_check_unique(line):
+                                                    all_lines.append(line)
+                                                    got_content = True
+                        except Exception as e_new:
+                            logging.warning(f"New batch-service v3 notes fallback failed: {e_new}")
 
-                    elif content_type == 'DppNotes':
-                        item_dpp = item.get('dpp')
-                        if item_dpp:
-                            for hw in item_dpp.get('homeworkIds', []):
+                        # Final fallback: item directly (may not have key)
+                        if not got_content:
+                            for hw in item.get('homeworkIds', []):
                                 for att in hw.get('attachmentIds', []):
                                     name = safe_topic(att.get('name'), topic)
                                     base_url = att.get('baseUrl', '')
                                     key = att.get('key', '')
-                                    if key:
+                                    if base_url and key:
                                         line = f"{name}:{base_url}{key}"
                                         if dedup.add_and_check_unique(line):
                                             all_lines.append(line)
                                             got_content = True
+
+                    elif content_type == 'DppNotes':
+                        # FIXED: Try new batch-service v3 endpoint for DPP PDFs
+                        try:
+                            new_ep_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{batch_id}/subject/{subject_id}/contents"
+                            new_ep_params = {
+                                "skip": 0,
+                                "limit": 20,
+                                "contentType": "DPP_PDF",
+                                "contentFilter": "ALL",
+                                "tagId": topic_id
+                            }
+                            web_headers = dict(headers)
+                            web_headers["client-type"] = "WEB"
+                            web_headers["X-SDK-Version"] = "0.0.28"
+                            web_headers["client-version"] = "5.2.15"
+                            new_data = await fetch_pwwp_data(session, new_ep_url, headers=web_headers, params=new_ep_params)
+                            if new_data and new_data.get("data"):
+                                for new_item in new_data["data"]:
+                                    item_data = new_item.get("data", {})
+                                    hw_list = item_data.get("homeworkIds", [])
+                                    for hw in hw_list:
+                                        hw_topic = safe_topic(hw.get("topic"), topic)
+                                        for att in hw.get("attachmentIds", []):
+                                            base_url = att.get("baseUrl", "")
+                                            key = att.get("key", "")
+                                            name = safe_topic(att.get("name"), hw_topic)
+                                            if base_url and key:
+                                                line = f"{name}:{base_url}{key}"
+                                                if dedup.add_and_check_unique(line):
+                                                    all_lines.append(line)
+                                                    got_content = True
+                        except Exception as e_new:
+                            logging.warning(f"New batch-service v3 DppNotes fallback failed: {e_new}")
+
+                        # Final fallback: item directly
+                        if not got_content:
+                            item_dpp = item.get('dpp')
+                            if item_dpp:
+                                for hw in item_dpp.get('homeworkIds', []):
+                                    for att in hw.get('attachmentIds', []):
+                                        name = safe_topic(att.get('name'), topic)
+                                        base_url = att.get('baseUrl', '')
+                                        key = att.get('key', '')
+                                        if base_url and key:
+                                            line = f"{name}:{base_url}{key}"
+                                            if dedup.add_and_check_unique(line):
+                                                all_lines.append(line)
+                                                got_content = True
 
             if not data.get("hasMore", True):
                 break
@@ -2427,7 +2512,7 @@ async def process_pwwp_subject(session, subject, batch_id, batch_name, zipf, jso
 
 def find_pw_old_batch(batch_search):
     try:
-        response = requests.get(f"https://allenextractor.github.io/rarestudy/batches.json")
+        response = requests.get(f"https://abhiguru143.github.io/AS-MULTIVERSE-PW/batch/batch.json")
         response.raise_for_status()
         data = response.json()
     except requests.exceptions.RequestException as e:
@@ -2724,6 +2809,18 @@ async def fetch_weekly_schedules(session, batch_id, date_str_iso, headers):
             subject_id = details.get("batchSubjectId", "")
             topic = safe_topic(details.get("topic"), "Unknown Topic")
             start_time = details.get("startTime", "")
+            chapter_id = details.get("chapterId", "")  # NEW: needed for v3 NOTES tagId
+
+            # NEW: Extract notes directly from weekly-schedules response (full key present)
+            direct_notes = []
+            for hw in details.get("homeworkIds", []):
+                hw_topic = safe_topic(hw.get("topic"), topic)
+                for att in hw.get("attachmentIds", []):
+                    base_url = att.get("baseUrl", "")
+                    key = att.get("key", "")
+                    att_name = safe_topic(att.get("name"), hw_topic)
+                    if base_url and key:
+                        direct_notes.append(f"{att_name}:{base_url}{key}")
 
             normalized.append({
                 "type": item_type,
@@ -2731,6 +2828,8 @@ async def fetch_weekly_schedules(session, batch_id, date_str_iso, headers):
                 "subject_id": subject_id,
                 "topic": topic,
                 "start_time": start_time,
+                "chapter_id": chapter_id,
+                "direct_notes": direct_notes,  # NEW: notes extracted directly from weekly-schedules
                 "raw": item
             })
 
@@ -2749,14 +2848,25 @@ async def fetch_weekly_schedules(session, batch_id, date_str_iso, headers):
 # Today's Class) to get the actual playable video URL (master.mpd),
 # DRM keys, and parentId/childId/videoId - plus PDF attachments.
 # ===============================================================
-async def fetch_date_schedule_details(session, batch_id, subject_id, schedule_id, topic, headers, dedup):
+async def fetch_date_schedule_details(session, batch_id, subject_id, schedule_id, topic, headers, dedup, chapter_id="", direct_notes=None):
     """
     Fetch schedule-details for ONE schedule item and extract video + notes lines.
     Mirrors the proven logic used in Full Batch / Today's Class (v1 endpoint).
+
+    Enhanced for WITHOUT LOGIN:
+    - direct_notes: pre-extracted notes from weekly-schedules response (full key present)
+    - chapter_id: used as tagId for v3 NOTES endpoint (more accurate than schedule_id)
+
     Returns (video_lines, notes_lines)
     """
     video_lines = []
     notes_lines = []
+
+    # Seed with directly extracted notes (from weekly-schedules — full key guaranteed)
+    if direct_notes:
+        for dn in direct_notes:
+            if dedup.add_and_check_unique(dn):
+                notes_lines.append(dn)
 
     if not subject_id or not schedule_id or str(subject_id).lower() == "none":
         return video_lines, notes_lines
@@ -2765,9 +2875,38 @@ async def fetch_date_schedule_details(session, batch_id, subject_id, schedule_id
     data = await fetch_pwwp_data(session, url, headers=headers)
 
     if not data or not data.get("success") or not data.get("data"):
+        # Even if schedule-details fails, we already have direct_notes from weekly-schedules
+        # Try v3 NOTES with chapter_id as extra fallback
+        if subject_id and chapter_id:
+            try:
+                web_headers = dict(headers)
+                web_headers["client-type"] = "WEB"
+                web_headers["X-SDK-Version"] = "0.0.28"
+                web_headers["client-version"] = "5.2.16"
+                v3_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{batch_id}/subject/{subject_id}/contents"
+                v3_params = {"skip": 0, "limit": 20, "contentType": "NOTES", "contentFilter": "ALL", "tagId": chapter_id}
+                v3_data = await fetch_pwwp_data(session, v3_url, headers=web_headers, params=v3_params)
+                if v3_data and v3_data.get("data"):
+                    for v3_item in v3_data["data"]:
+                        item_d = v3_item.get("data", {})
+                        for hw in item_d.get("homeworkIds", []):
+                            hw_name = safe_topic(hw.get("topic"), topic)
+                            for att in hw.get("attachmentIds", []):
+                                base_url = att.get("baseUrl", "")
+                                key = att.get("key", "")
+                                att_name = safe_topic(att.get("name"), hw_name)
+                                if base_url and key:
+                                    line = f"{att_name}:{base_url}{key}"
+                                    if dedup.add_and_check_unique(line):
+                                        notes_lines.append(line)
+            except Exception as e_v3:
+                logging.warning(f"v3 NOTES chapterId fallback for {schedule_id} failed: {e_v3}")
         return video_lines, notes_lines
 
     detail_item = data["data"]
+
+    # Also get chapterId from schedule-details response (may be more accurate)
+    sd_chapter_id = detail_item.get("chapterId", "") or chapter_id
 
     # --- VIDEO EXTRACTION (master.mpd + parentId/childId/videoId + DRM) ---
     video_details = detail_item.get("videoDetails", {})
@@ -2780,23 +2919,52 @@ async def fetch_date_schedule_details(session, batch_id, subject_id, schedule_id
         )
         vurl, drm = extract_comprehensive_video_url(video_details, parent_id, child_id, vid)
         if vurl:
-            thumb_url = extract_thumbnail_url(video_details)
-            line = with_thumbnail(f"{topic}:{vurl}{drm}", thumb_url)
+            line = f"{topic}:{vurl}{drm}"
             if dedup.add_and_check_unique(line):
                 video_lines.append(line)
 
     # --- NOTES / PDF EXTRACTION ---
-    homework_ids = detail_item.get("homeworkIds", [])
-    for hw in homework_ids:
-        hw_topic = safe_topic(hw.get("topic"), topic)
-        for att in hw.get("attachmentIds", []):
-            base_url = att.get("baseUrl", "")
-            key = att.get("key", "")
-            name = safe_topic(att.get("name"), hw_topic)
-            if base_url and key:
-                line = f"{name}:{base_url}{key}"
-                if dedup.add_and_check_unique(line):
-                    notes_lines.append(line)
+    # Try v3 NOTES endpoint with chapterId (tagId) FIRST — most reliable for without-login
+    notes_added_v3 = False
+    if subject_id and sd_chapter_id:
+        try:
+            web_headers = dict(headers)
+            web_headers["client-type"] = "WEB"
+            web_headers["X-SDK-Version"] = "0.0.28"
+            web_headers["client-version"] = "5.2.16"
+            v3_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{batch_id}/subject/{subject_id}/contents"
+            v3_params = {"skip": 0, "limit": 20, "contentType": "NOTES", "contentFilter": "ALL", "tagId": sd_chapter_id}
+            v3_data = await fetch_pwwp_data(session, v3_url, headers=web_headers, params=v3_params)
+            if v3_data and v3_data.get("data"):
+                for v3_item in v3_data["data"]:
+                    item_d = v3_item.get("data", {})
+                    for hw in item_d.get("homeworkIds", []):
+                        hw_name = safe_topic(hw.get("topic"), topic)
+                        for att in hw.get("attachmentIds", []):
+                            base_url = att.get("baseUrl", "")
+                            key = att.get("key", "")
+                            att_name = safe_topic(att.get("name"), hw_name)
+                            if base_url and key:
+                                line = f"{att_name}:{base_url}{key}"
+                                if dedup.add_and_check_unique(line):
+                                    notes_lines.append(line)
+                                    notes_added_v3 = True
+        except Exception as e_v3n:
+            logging.warning(f"v3 NOTES chapterId for date schedule {schedule_id} failed: {e_v3n}")
+
+    # Fallback: v1/schedule-details homeworkIds (if v3 got nothing)
+    if not notes_added_v3:
+        homework_ids = detail_item.get("homeworkIds", [])
+        for hw in homework_ids:
+            hw_topic = safe_topic(hw.get("topic"), topic)
+            for att in hw.get("attachmentIds", []):
+                base_url = att.get("baseUrl", "")
+                key = att.get("key", "")
+                name = safe_topic(att.get("name"), hw_topic)
+                if base_url and key:
+                    line = f"{name}:{base_url}{key}"
+                    if dedup.add_and_check_unique(line):
+                        notes_lines.append(line)
 
     # --- DPP NOTES (only from dpp.homeworkIds) ---
     dpp = detail_item.get("dpp")
@@ -2978,7 +3146,9 @@ async def process_date_content(session, batch_id, batch_name, start_epoch, end_e
     for item in schedule_items:
         detail_tasks.append(
             fetch_date_schedule_details(
-                session, batch_id, item["subject_id"], item["schedule_id"], item["topic"], headers, dedup
+                session, batch_id, item["subject_id"], item["schedule_id"], item["topic"], headers, dedup,
+                chapter_id=item.get("chapter_id", ""),
+                direct_notes=item.get("direct_notes", [])
             )
         )
 
@@ -3069,9 +3239,10 @@ async def process_date_content(session, batch_id, batch_name, start_epoch, end_e
 # CRITICAL FIX: Now accepts batch_pw_id for non-purchased batches
 # CRITICAL FIX: Skips items with None subject_id to prevent 404
 # ===============================================================
-async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSession, selected_batch_id, subject_id, schedule_id, headers: Dict) -> List[str]:
+async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSession, selected_batch_id, subject_id, schedule_id, headers: Dict, skip_video: bool = False) -> List[str]:
     """Fetch content details for a single today's schedule item.
-    Uses v1 schedule-details endpoint (confirmed working)."""
+    Uses v1 schedule-details endpoint (confirmed working).
+    skip_video=True: only extract notes/DPP (video URL already captured from v2 response)."""
     content = []
 
     # CRITICAL FIX: Skip if subject_id is None or invalid
@@ -3085,82 +3256,251 @@ async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSessio
     if data and data.get("success") and data.get("data"):
         data_item = data["data"]
 
-        # --- VIDEO EXTRACTION ---
-        video_details = data_item.get('videoDetails', {})
-        if video_details:
-            # CRITICAL FIX: Use safe_topic for name extraction
-            name = safe_topic(data_item.get('topic'), "Unknown Topic")
+        # --- VIDEO EXTRACTION (skip if direct URL already captured from v2) ---
+        if not skip_video:
+            video_details = data_item.get('videoDetails', {})
+            if video_details:
+                # CRITICAL FIX: Use safe_topic for name extraction
+                name = safe_topic(data_item.get('topic'), "Unknown Topic")
 
-            parent_id, child_id, video_id = extract_pw_ids(
-                video_details=video_details,
-                schedule_data=data_item,
-                schedule_id=schedule_id,
-                batch_id=selected_batch_id
-            )
+                parent_id, child_id, video_id = extract_pw_ids(
+                    video_details=video_details,
+                    schedule_data=data_item,
+                    schedule_id=schedule_id,
+                    batch_id=selected_batch_id
+                )
 
-            video_url, drm_info = extract_comprehensive_video_url(video_details, parent_id, child_id, video_id)
+                video_url, drm_info = extract_comprehensive_video_url(video_details, parent_id, child_id, video_id)
 
-            if video_url:
-                thumb_url = extract_thumbnail_url(video_details)
-                line = with_thumbnail(f"{name}:{video_url}{drm_info}", thumb_url) + "\n"
-                content.append(line)
-
-        # --- HOMEWORK / NOTES (PDFs) ---
-        homework_ids = data_item.get('homeworkIds', [])
-        for homework in homework_ids:
-            attachment_ids = homework.get('attachmentIds', [])
-            # CRITICAL FIX: Use safe_topic
-            name = safe_topic(homework.get('topic'), "Notes")
-            for attachment in attachment_ids:
-                url = attachment.get('baseUrl', '') + attachment.get('key', '')
-                if url:
-                    line = f"{name}:{url}\n"
+                if video_url:
+                    line = f"{name}:{video_url}{drm_info}\n"
                     content.append(line)
 
-        # --- DPP HOMEWORK ---
-        dpp = data_item.get('dpp')
-        if dpp:
-            dpp_homework_ids = dpp.get('homeworkIds', [])
-            for homework in dpp_homework_ids:
+        # --- HOMEWORK / NOTES (PDFs) ---
+        # FIXED: v1/schedule-details homeworkIds may lack 'key' in attachmentIds.
+        # Try batch-service v3 NOTES endpoint first (returns full baseUrl+key).
+        # CRITICAL: Use chapterId from schedule-details as tagId (NOT schedule_id)
+        chapter_id_for_v3 = data_item.get("chapterId", "") or schedule_id
+        notes_added = False
+        try:
+            web_headers = dict(headers)
+            web_headers["client-type"] = "WEB"
+            web_headers["X-SDK-Version"] = "0.0.28"
+            web_headers["client-version"] = "5.2.16"
+            v3_notes_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{selected_batch_id}/subject/{subject_id}/contents"
+            v3_notes_params = {
+                "skip": 0,
+                "limit": 20,
+                "contentType": "NOTES",
+                "contentFilter": "ALL",
+                "tagId": chapter_id_for_v3
+            }
+            v3_notes_data = await fetch_pwwp_data(session, v3_notes_url, headers=web_headers, params=v3_notes_params)
+            if v3_notes_data and v3_notes_data.get("data"):
+                for v3_item in v3_notes_data["data"]:
+                    item_d = v3_item.get("data", {})
+                    for hw in item_d.get("homeworkIds", []):
+                        hw_name = safe_topic(hw.get("topic"), "Notes")
+                        for att in hw.get("attachmentIds", []):
+                            base_url = att.get("baseUrl", "")
+                            key = att.get("key", "")
+                            att_name = safe_topic(att.get("name"), hw_name)
+                            if base_url and key:
+                                line = f"{att_name}:{base_url}{key}\n"
+                                content.append(line)
+                                notes_added = True
+        except Exception as e_v3n:
+            logging.warning(f"v3 NOTES for today's schedule {schedule_id} failed: {e_v3n}")
+
+        # Fallback: extract from v1/schedule-details homeworkIds (may be incomplete)
+        if not notes_added:
+            homework_ids = data_item.get('homeworkIds', [])
+            for homework in homework_ids:
                 attachment_ids = homework.get('attachmentIds', [])
-                name = safe_topic(homework.get('topic'), "DPP")
+                name = safe_topic(homework.get('topic'), "Notes")
                 for attachment in attachment_ids:
-                    url = attachment.get('baseUrl', '') + attachment.get('key', '')
-                    if url:
-                        line = f"{name}:{url}\n"
+                    base_url = attachment.get('baseUrl', '')
+                    key = attachment.get('key', '')
+                    full_url = base_url + key
+                    if full_url and full_url != base_url:  # key must be non-empty
+                        line = f"{name}:{full_url}\n"
                         content.append(line)
+
+        # --- DPP HOMEWORK ---
+        # FIXED: Try v3 DPP_PDF endpoint first for full key
+        # CRITICAL: Use chapterId from schedule-details as tagId (NOT schedule_id)
+        dpp_added = False
+        try:
+            web_headers = dict(headers)
+            web_headers["client-type"] = "WEB"
+            web_headers["X-SDK-Version"] = "0.0.28"
+            web_headers["client-version"] = "5.2.16"
+            v3_dpp_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{selected_batch_id}/subject/{subject_id}/contents"
+            v3_dpp_params = {
+                "skip": 0,
+                "limit": 20,
+                "contentType": "DPP_PDF",
+                "contentFilter": "ALL",
+                "tagId": chapter_id_for_v3
+            }
+            v3_dpp_data = await fetch_pwwp_data(session, v3_dpp_url, headers=web_headers, params=v3_dpp_params)
+            if v3_dpp_data and v3_dpp_data.get("data"):
+                for v3_item in v3_dpp_data["data"]:
+                    item_d = v3_item.get("data", {})
+                    for hw in item_d.get("homeworkIds", []):
+                        hw_name = safe_topic(hw.get("topic"), "DPP")
+                        for att in hw.get("attachmentIds", []):
+                            base_url = att.get("baseUrl", "")
+                            key = att.get("key", "")
+                            att_name = safe_topic(att.get("name"), hw_name)
+                            if base_url and key:
+                                line = f"{att_name}:{base_url}{key}\n"
+                                content.append(line)
+                                dpp_added = True
+        except Exception as e_v3d:
+            logging.warning(f"v3 DPP_PDF for today's schedule {schedule_id} failed: {e_v3d}")
+
+        # Fallback: extract from v1/schedule-details dpp.homeworkIds
+        if not dpp_added:
+            dpp = data_item.get('dpp')
+            if dpp:
+                dpp_homework_ids = dpp.get('homeworkIds', [])
+                for homework in dpp_homework_ids:
+                    attachment_ids = homework.get('attachmentIds', [])
+                    name = safe_topic(homework.get('topic'), "DPP")
+                    for attachment in attachment_ids:
+                        base_url = attachment.get('baseUrl', '')
+                        key = attachment.get('key', '')
+                        full_url = base_url + key
+                        if full_url and full_url != base_url:
+                            line = f"{name}:{full_url}\n"
+                            content.append(line)
     else:
-        logging.warning(f"No Data Found For Id - {schedule_id}")
+        logging.warning(f"No Data From v1/schedule-details for {schedule_id} — trying v3 directly")
+        # Even if schedule-details fails, try v3 endpoints directly
+        try:
+            web_headers = dict(headers)
+            web_headers["client-type"] = "WEB"
+            web_headers["X-SDK-Version"] = "0.0.28"
+            web_headers["client-version"] = "5.2.16"
+            v3_base_url = f"https://api.penpencil.co/batch-service/v3/batch-subject-schedules/{selected_batch_id}/subject/{subject_id}/contents"
+            for ct_type, ct_label in [("NOTES", "Notes"), ("DPP_PDF", "DPP")]:
+                v3_params = {
+                    "skip": 0,
+                    "limit": 20,
+                    "contentType": ct_type,
+                    "contentFilter": "ALL",
+                    "tagId": schedule_id  # fallback to schedule_id when no chapterId available
+                }
+                v3_data = await fetch_pwwp_data(session, v3_base_url, headers=web_headers, params=v3_params)
+                if v3_data and v3_data.get("data"):
+                    for v3_item in v3_data["data"]:
+                        item_d = v3_item.get("data", {})
+                        for hw in item_d.get("homeworkIds", []):
+                            hw_name = safe_topic(hw.get("topic"), ct_label)
+                            for att in hw.get("attachmentIds", []):
+                                base_url = att.get("baseUrl", "")
+                                key = att.get("key", "")
+                                att_name = safe_topic(att.get("name"), hw_name)
+                                if base_url and key:
+                                    line = f"{att_name}:{base_url}{key}\n"
+                                    content.append(line)
+        except Exception as e_fallback:
+            logging.warning(f"v3 direct fallback for {schedule_id} failed: {e_fallback}")
     return content
 
 
 # ===============================================================
-# Today's schedule using the CONFIRMED WORKING v1 endpoint
-# (matches the proven pww.py implementation)
+# Today's schedule — v2 endpoint (BroMS confirmed working)
+# v2 returns data[].data with direct url field when scheduleType=awsVideo
+# For items with direct url, we skip schedule-details call (faster + reliable)
+# For items without url (vimeo/live/pending), we fall back to schedule-details
 # ===============================================================
 async def get_pwwp_all_todays_schedule_content(session: aiohttp.ClientSession, selected_batch_id: str, batch_pw_id: str, headers: Dict) -> List[str]:
-    """Fetch all of today's schedule content using the working v1 endpoint."""
+    """Fetch all of today's schedule content using v2 endpoint (BroMS confirmed).
+    Extracts direct CloudFront URLs when available; falls back to schedule-details."""
     all_content = []
 
-    url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/todays-schedule"
-    todays_schedule_details = await fetch_pwwp_data(session, url, headers)
+    # FIXED: Use v2 endpoint (BroMS confirmed) — v1 returns different structure
+    url = f"https://api.penpencil.co/v2/batches/{selected_batch_id}/todays-schedule"
+    params = {"batchId": selected_batch_id}
+    todays_schedule_details = await fetch_pwwp_data(session, url, headers, params=params)
+
+    # Fallback to v1 if v2 fails
+    if not todays_schedule_details or not todays_schedule_details.get("data"):
+        logging.warning("v2 todays-schedule failed, falling back to v1")
+        url_v1 = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/todays-schedule"
+        todays_schedule_details = await fetch_pwwp_data(session, url_v1, headers)
 
     if todays_schedule_details and todays_schedule_details.get("success") and todays_schedule_details.get("data"):
         tasks = []
         valid_items = []
+        direct_url_items = []  # items where we already have the URL from v2 response
 
         for item in todays_schedule_details['data']:
-            schedule_id = item.get('_id')
-            subject_id = item.get('batchSubjectId')
+            # v2 response: item has _id, type, data{} sub-object
+            # v1 response: item fields are at top level
+            item_data = item.get('data') if isinstance(item.get('data'), dict) else item
+
+            schedule_id = item.get('_id') or item_data.get('_id')
+            subject_id = item_data.get('batchSubjectId') or item.get('batchSubjectId')
+            topic = safe_topic(item_data.get('topic'), "Unknown Topic")
 
             # CRITICAL FIX: Skip items with None/invalid subject_id
             if not subject_id or str(subject_id).lower() == "none":
                 logging.warning(f"Skipping item {schedule_id}: subject_id is None/invalid")
                 continue
 
-            task = asyncio.create_task(get_pwwp_todays_schedule_content_details(session, selected_batch_id, subject_id, schedule_id, headers))
+            # OPTIMIZATION (BroMS): v2 response has direct url for awsVideo items
+            schedule_type = item_data.get('scheduleType', '')
+            direct_url = item_data.get('url', '')
+
+            # FIXED: Extract notes/DPP directly from v2/todays-schedule response
+            # item_data.homeworkIds has full attachmentIds with baseUrl+key
+            for hw in item_data.get('homeworkIds', []):
+                hw_topic = safe_topic(hw.get('topic'), topic)
+                for att in hw.get('attachmentIds', []):
+                    base_url = att.get('baseUrl', '')
+                    key = att.get('key', '')
+                    att_name = safe_topic(att.get('name'), hw_topic)
+                    if base_url and key:
+                        note_line = f"{att_name}:{base_url}{key}\n"
+                        direct_url_items.append(note_line)
+
+            # Also extract DPP from dpp.homeworkIds in response
+            dpp_obj = item_data.get('dpp') or {}
+            for hw in dpp_obj.get('homeworkIds', []):
+                hw_topic = safe_topic(hw.get('topic'), topic)
+                for att in hw.get('attachmentIds', []):
+                    base_url = att.get('baseUrl', '')
+                    key = att.get('key', '')
+                    att_name = safe_topic(att.get('name'), hw_topic)
+                    if base_url and key:
+                        dpp_line = f"{att_name}:{base_url}{key}\n"
+                        direct_url_items.append(dpp_line)
+
+            if direct_url and (
+                '.m3u8' in direct_url or '.mpd' in direct_url or 'cloudfront' in direct_url
+            ):
+                # Direct URL available — no schedule-details needed for video
+                line = f"{topic}:{direct_url}\n"
+                direct_url_items.append(line)
+                logging.info(f"Direct URL captured for {topic}: {direct_url}")
+                # Still call schedule-details for notes/DPP as additional fallback
+                task = asyncio.create_task(
+                    get_pwwp_todays_schedule_content_details(session, selected_batch_id, subject_id, schedule_id, headers, skip_video=True)
+                )
+            else:
+                # No direct URL — full schedule-details call needed
+                task = asyncio.create_task(
+                    get_pwwp_todays_schedule_content_details(session, selected_batch_id, subject_id, schedule_id, headers, skip_video=False)
+                )
+
             tasks.append(task)
             valid_items.append(item)
+
+        # Add direct URL items first
+        all_content.extend(direct_url_items)
 
         if tasks:
             results = await asyncio.gather(*tasks)
@@ -3188,7 +3528,10 @@ async def start(bot, message):
     _save_broadcast_users(broadcast_users)
     random_image_url = random.choice(image_list)
     keyboard = [
-        [InlineKeyboardButton("PHYSICS WALLAH", callback_data="pwwp")],
+        [
+            InlineKeyboardButton("WITH LOGIN 🚀", callback_data="pwwp_with_login"),
+            InlineKeyboardButton("WITHOUT LOGIN 🦋", callback_data="pwwp_without_login")
+        ],
         [InlineKeyboardButton("😋Join Channel", url="https://t.me/teamcinderella")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3295,16 +3638,24 @@ def _run_async_in_thread(coro):
     """Helper to run async coroutine in ThreadPool"""
     asyncio.run(coro)
 
-@bot.on_callback_query(filters.regex("^pwwp$"))
-async def pwwp_callback(bot, callback_query):
+@bot.on_callback_query(filters.regex("^pwwp_without_login$"))
+async def pwwp_without_login_callback(bot, callback_query):
     user_id = callback_query.from_user.id
     await callback_query.answer()
 
     if user_id not in auth_users:
-        await bot.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot\nSo DM me for access\nID: @SmartBoy_ApnaMS**")
+        await bot.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot\nSo DM me for access\nID: @JapaneseFury**")
         return
 
     THREADPOOL.submit(_run_async_in_thread, process_pwwp(bot, callback_query.message, user_id))
+
+
+@bot.on_callback_query(filters.regex("^pwwp_with_login$"))
+async def pwwp_with_login_callback(bot, callback_query):
+    user_id = callback_query.from_user.id
+    await callback_query.answer()
+    # WITH LOGIN is free for all users — no auth_users check
+    THREADPOOL.submit(_run_async_in_thread, process_pwwp_with_login(bot, callback_query.message, user_id))
 
 
 # ===============================================================
@@ -3331,7 +3682,7 @@ async def batch_next_callback(bot, callback_query):
         _, text = get_batches_for_page(user_id, new_page)
         keyboard = build_batch_pagination_keyboard(user_id, new_page)
 
-        header = f"**Send index number of the course to download.\n\n{text}\n\nIf Your Batch Not Listed Above Enter contact: @SmartBoy_ApnaMS**"
+        header = f"**Send index number of the course to download.\n\n{text}\n\nIf Your Batch Not Listed Above Enter contact: @JapaneseFury**"
         try:
             await callback_query.message.edit_text(header, reply_markup=keyboard)
         except Exception as e:
@@ -3357,7 +3708,7 @@ async def batch_prev_callback(bot, callback_query):
         _, text = get_batches_for_page(user_id, new_page)
         keyboard = build_batch_pagination_keyboard(user_id, new_page)
 
-        header = f"**Send index number of the course to download.\n\n{text}\n\nIf Your Batch Not Listed Above Contact: @SmartBoy_ApnaMS**"
+        header = f"**Send index number of the course to download.\n\n{text}\n\nIf Your Batch Not Listed Above Contact: @JapaneseFury**"
         try:
             await callback_query.message.edit_text(header, reply_markup=keyboard)
         except Exception as e:
@@ -3371,21 +3722,22 @@ async def batch_page_info_callback(bot, callback_query):
 
 
 # ===============================================================
-# PW: Main Processing Function (with ALL fixes integrated)
+# PW: WITH LOGIN — Auto-fetch all purchased batches (no batch name input)
+# Free for all users (no auth_users check)
 # ===============================================================
-async def process_pwwp(bot, m, user_id):
+async def process_pwwp_with_login(bot, m, user_id):
     editable = await m.reply_text(
-        "**Enter Working Access Token\n\nOR\n\nEnter Phone Number(without +91)\n\n"
-        "NOTE: Jis Batch Ka Token hai uska Sara Content aayega with Videos & PDFs "
-        "But Agar Us Batch ka Token nahi to Sirf Notes & DPP PDFs hi Milegi😒.**"
+        "**WITH LOGIN 🚀\n\n"
+        "Enter Working Access Token\n\nOR\n\nEnter Phone Number(without +91)\n\n"
+        "Bot will auto-fetch ALL your purchased & free batches!**"
     )
 
     try:
-        input1 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
+        input1 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
         raw_text1 = input1.text
         await input1.delete(True)
     except:
-        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
+        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
         return
 
     headers = get_pw_mobile_headers("")
@@ -3413,11 +3765,509 @@ async def process_pwwp(bot, m, user_id):
 
                 editable = await editable.edit("**ENTER OTP YOU RECEIVED\n\nOnly Enter 6 digit OTP.**")
                 try:
-                    input2 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
+                    input2 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
                     otp = input2.text
                     await input2.delete(True)
                 except:
-                    await editable.edit("**Timeout! You took too long to respond\n\nPlease response under 5 Minutes🙂.**")
+                    await editable.edit("**Timeout! You took too long to respond\n\nPlease response under 60 seconds🙂.**")
+                    return
+
+                payload = {
+                    "username": phone,
+                    "otp": otp,
+                    "client_id": "system-admin",
+                    "client_secret": "KjPXuAVfC5xbmgreETNMaL7z",
+                    "grant_type": "password",
+                    "organizationId": "5eb393ee95fab7468a79d189",
+                    "latitude": 0,
+                    "longitude": 0
+                }
+
+                try:
+                    async with session.post(
+                        f"https://api.penpencil.co/v3/oauth/token",
+                        json=payload, headers=get_pw_login_headers()
+                    ) as response:
+                        access_token = (await response.json())["data"]["access_token"]
+                        await editable.edit(
+                            f"<b>✅Please Renew Token From: @pwextract_bot(New Duplicate token). </b>\n\n"
+                            f"<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n"
+                        )
+                        editable = await m.reply_text("**Fetching ALL your batches automatically...\n\nPlease Wait...🤭**")
+                except Exception as e:
+                    await editable.edit(f"**Error : {e}**")
+                    return
+            else:
+                access_token = raw_text1
+                direct_token_login = True
+
+            headers = get_pw_mobile_headers(access_token)
+
+            # Validate token — with fallback endpoints
+            token_valid = False
+            try:
+                params = {'mode': '1', 'page': '1'}
+                async with session.get(
+                    f"https://api.penpencil.co/v3/batches/my-batches",
+                    headers=headers, params=params
+                ) as response:
+                    if response.status == 200:
+                        test_data = await response.json()
+                        if test_data.get("success") is True:
+                            token_valid = True
+                        elif test_data.get("data") is not None:
+                            token_valid = True
+            except Exception as e:
+                logging.warning(f"[WithLogin] my-batches validation failed: {e}")
+
+            if not token_valid:
+                try:
+                    async with session.get(
+                        f"https://api.penpencil.co/v2/batches/all-batches",
+                        headers=headers, params={'page': '1'}
+                    ) as response:
+                        if response.status == 200:
+                            fb_data = await response.json()
+                            if fb_data.get("success") is True or fb_data.get("data") is not None:
+                                token_valid = True
+                except Exception as e:
+                    logging.warning(f"[WithLogin] all-batches fallback failed: {e}")
+
+            if not token_valid:
+                try:
+                    async with session.get(
+                        f"https://api.penpencil.co/v3/users/me",
+                        headers=headers
+                    ) as response:
+                        if response.status == 200:
+                            prof_data = await response.json()
+                            if prof_data.get("success") is True or prof_data.get("data"):
+                                token_valid = True
+                except Exception as e:
+                    logging.warning(f"[WithLogin] user profile fallback failed: {e}")
+
+            if not token_valid:
+                await editable.edit(
+                    "**```\nLogin Failed TOKEN IS EXPIRED```\n"
+                    "Please Enter Working Token\n"
+                    "                       OR\n"
+                    "Login With Phone Number**"
+                )
+                return
+
+            if direct_token_login:
+                await editable.edit(
+                    f"<b>✅Please Renew Token From: @pwextract_bot(New Duplicate token).</b>\n\n"
+                    f"<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n"
+                )
+                editable = await m.reply_text("**Fetching ALL your batches automatically...\n\nPlease Wait...🤭**")
+
+            # ================================================================
+            # Auto-fetch ALL purchased + free batches (oldest to newest)
+            # No batch name input needed — bot fetches all batches automatically
+            # ================================================================
+            all_batches = []
+            try:
+                page = 1
+                while page <= 50:
+                    async with session.get(
+                        f"https://api.penpencil.co/v3/batches/my-batches",
+                        headers=headers,
+                        params={'mode': '1', 'page': str(page)}
+                    ) as resp:
+                        if resp.status != 200:
+                            break
+                        resp_data = await resp.json()
+                        batch_list = resp_data.get("data", [])
+                        if not batch_list:
+                            break
+                        all_batches.extend(batch_list)
+                        if len(batch_list) < 10:
+                            break
+                        page += 1
+            except Exception as e:
+                logging.warning(f"[WithLogin] my-batches fetch failed: {e}")
+
+            # Reverse to show oldest first (as requested)
+            all_batches = list(reversed(all_batches))
+
+            if not all_batches:
+                await editable.edit("**No purchased batches found in this account.\n\nMake sure you are logged in with the correct account.**")
+                return
+
+            # ==========================================================
+            # Pagination system for batch selection (same as without-login)
+            # ==========================================================
+            user_batch_pages[user_id] = {
+                "batches": all_batches,
+                "page": 0,
+                "message_id": None
+            }
+
+            _, text = get_batches_for_page(user_id, 0)
+            keyboard = build_batch_pagination_keyboard(user_id, 0)
+
+            total_batches = len(all_batches)
+            total_pages = (total_batches + 9) // 10
+
+            header = (
+                f"**🚀 WITH LOGIN — Your Purchased Batches\n\n"
+                f"Send index number of the batch to download.\n\n"
+                f"{text}\n\n"
+                f"Showing page 1 of {total_pages} ({total_batches} total batches)\n"
+                f"Multiple batches: send like `1&2&3`**"
+            )
+
+            await editable.edit(header, reply_markup=keyboard)
+
+            try:
+                input4 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                raw_text4 = input4.text
+                await input4.delete(True)
+            except:
+                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+                user_batch_pages.pop(user_id, None)
+                return
+
+            user_batch_pages.pop(user_id, None)
+
+            # Parse batch index input (supports "1&2&3" format)
+            raw_index_text = raw_text4.strip()
+            index_parts = [p.strip() for p in raw_index_text.split('&') if p.strip()]
+            all_index_parts_are_digits = all(p.isdigit() for p in index_parts)
+
+            selected_batches_list = []
+
+            if all_index_parts_are_digits and len(index_parts) >= 1:
+                if len(index_parts) > 10:
+                    raise Exception("❌ Maximum 10 batch indices allowed at once.\nExample: 1&2&3&4&5")
+                for idx_str in index_parts:
+                    sel_idx = int(idx_str)
+                    if 1 <= sel_idx <= len(all_batches):
+                        c = all_batches[sel_idx - 1]
+                        selected_batches_list.append((c['_id'], c['name']))
+                    else:
+                        raise Exception(f"Invalid index {sel_idx}. Please enter a number between 1 and {len(all_batches)}")
+            else:
+                raise Exception("Invalid input. Please enter a valid index number like `1` or `1&2&3`.")
+
+            total_batches_selected = len(selected_batches_list)
+
+            # ==========================================================
+            # Loop over selected batches — same flow as process_pwwp
+            # ==========================================================
+            for batch_loop_idx, (sel_batch_id, sel_batch_name) in enumerate(selected_batches_list, start=1):
+                selected_batch_id = sel_batch_id
+                selected_batch_name = sel_batch_name
+                clean_batch_name = selected_batch_name.replace("/", "-").replace("|", "-")
+                clean_file_name = f"{user_id}_{clean_batch_name}"
+
+                batch_progress = f"Batch Index {batch_loop_idx:02d} of {total_batches_selected:02d}: {selected_batch_name}" if total_batches_selected > 1 else f"You Choosed Batch\n**{selected_batch_name}**"
+                selected_batch_pw_id = None
+
+                await editable.edit(
+                    f"{batch_progress}\n\n"
+                    "1.```\nFull Batch```\n"
+                    "2.```\nToday's Class```\n"
+                    "3.```\nKhazana```\n"
+                    "4.```\n📅 Select Date```\n\n"
+                    "**Multiple options: send like `1&2` or `1&2&4`**"
+                )
+
+                try:
+                    input6 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                    raw_text6 = input6.text.strip()
+                    await input6.delete(True)
+                except ListenerTimeout:
+                    await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+                    return
+                except Exception as e:
+                    logging.exception("Error during option listening:")
+                    try:
+                        await editable.edit(f"**Error: {e}**")
+                    except:
+                        pass
+                    return
+
+                option_parts = [p.strip() for p in raw_text6.split('&') if p.strip()]
+                selected_options = list(dict.fromkeys(option_parts))
+
+                date_input_for_4 = None
+                if '4' in selected_options:
+                    await editable.edit(
+                        "**📅 Select Date\n\n"
+                        "Single Date Format:\n"
+                        "`16/06/2026`\n\n"
+                        "Multiple Dates Format (max 10):\n"
+                        "`15/06/2026&16/06/2026&21/09/2025`\n\n"
+                        "Connect dates with `&` koi space mat dena bich me.\n\n"
+                        "This will extract all classes scheduled on those dates (IST), videos & PDFs both.**"
+                    )
+                    try:
+                        input_date_pre = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                        date_input_for_4 = input_date_pre.text.strip()
+                        await input_date_pre.delete(True)
+                    except:
+                        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+                        return
+
+                for opt_loop_idx, current_option in enumerate(selected_options):
+                    if opt_loop_idx > 0:
+                        await asyncio.sleep(3)
+
+                    await editable.edit(f"**Extracting course : {selected_batch_name} ...**")
+                    start_time = time.time()
+
+                    if current_option == '1':
+                        batch_details = None
+                        for bid, label in [(selected_batch_id, "_id"), (selected_batch_pw_id, "batchId")]:
+                            if not bid:
+                                continue
+                            try:
+                                url = f"https://api.penpencil.co/v3/batches/{bid}/details"
+                                batch_details = await fetch_pwwp_data(session, url, headers=headers)
+                                if batch_details and batch_details.get("success"):
+                                    break
+                            except Exception as e:
+                                logging.warning(f"Batch details failed with {label}={bid}: {e}")
+
+                        if batch_details and batch_details.get("success"):
+                            subjects = batch_details.get("data", {}).get("subjects", [])
+                            json_data = {selected_batch_name: {}}
+                            all_subject_urls = {}
+
+                            with zipfile.ZipFile(f"{clean_file_name}.zip", 'w') as zipf:
+                                subject_tasks = [
+                                    process_pwwp_subject(session, subject, selected_batch_id, selected_batch_name, zipf, json_data, all_subject_urls, headers)
+                                    for subject in subjects
+                                ]
+                                await asyncio.gather(*subject_tasks)
+
+                            with open(f"{clean_file_name}.json", 'w') as f:
+                                json.dump(json_data, f, indent=4)
+
+                            with open(f"{clean_file_name}.txt", 'w', encoding='utf-8') as f:
+                                for subject in subjects:
+                                    subject_name = safe_topic(subject.get("subject"), "Unknown Subject")
+                                    if subject_name in all_subject_urls:
+                                        f.write('\n'.join(all_subject_urls[subject_name]) + '\n')
+                        else:
+                            raise Exception(f"Error fetching batch details")
+
+                    elif current_option == '2':
+                        _original_batch_name_for_today = selected_batch_name
+                        today_schedule = await get_pwwp_all_todays_schedule_content(session, selected_batch_id, selected_batch_pw_id, headers)
+                        if today_schedule:
+                            clean_file_name = f"{user_id}_today_class"
+                            with open(f"{clean_file_name}.txt", "w", encoding="utf-8") as f:
+                                f.writelines(today_schedule)
+                            selected_batch_name = f"Today's Class ({_original_batch_name_for_today})"
+                        else:
+                            raise Exception("No classes found for today.\n\nSo Revise today and prepare for tomorrow😊.")
+
+                    elif current_option == '4':
+                        date_input = date_input_for_4
+                        raw_date_parts = [d.strip() for d in date_input.split('&') if d.strip()]
+                        if len(raw_date_parts) > 10:
+                            await editable.edit("**❌ Maximum 10 dates allowed at once.**")
+                            return
+
+                        parsed_dates = []
+                        for raw_d in raw_date_parts:
+                            s_ep, e_ep, t_date, disp_date = parse_user_date_to_range(raw_d)
+                            if s_ep is None:
+                                await editable.edit(f"**❌ Invalid Date Format: `{raw_d}`\n\nPlease send dates in DD/MM/YYYY format.**")
+                                return
+                            parsed_dates.append((s_ep, e_ep, t_date, disp_date))
+
+                        total_dates = len(parsed_dates)
+                        is_multi = total_dates > 1
+
+                        if is_multi:
+                            date_labels = " | ".join(d[3] for d in parsed_dates)
+                            await editable.edit(f"**📅 Fetching classes for {total_dates} dates...\n\nDates: {date_labels}\n\nPlease Wait...🤭**")
+
+                            for idx, (s_ep, e_ep, t_date, disp_date) in enumerate(parsed_dates, start=1):
+                                index_label = f"{idx:02d} of {total_dates:02d}"
+                                await editable.edit(f"**📅 Extracting date {index_label}...\nDate: {disp_date}\n\nPlease Wait...🤭**")
+
+                                txt_path, zip_path, total_schedules, error = await process_date_content(
+                                    session, selected_batch_id, selected_batch_name,
+                                    s_ep, e_ep, t_date, headers, user_id
+                                )
+
+                                if error or not txt_path or not os.path.exists(txt_path):
+                                    await m.reply_text(f"**⚠️ {index_label} | {disp_date} — No content found.**")
+                                    continue
+
+                                caption = (
+                                    f"**Batch Name : ```\n{selected_batch_name}```\n"
+                                    f"📅 Date: {disp_date}\n"
+                                    f"📊 Total Classes: {total_schedules}\n"
+                                    f"Extracted By:@JapaneseFury**"
+                                )
+                                try:
+                                    await bot.send_document(m.chat.id, document=txt_path, caption=caption)
+                                    if zip_path and os.path.exists(zip_path):
+                                        await bot.send_document(m.chat.id, document=zip_path, caption=caption)
+                                except Exception as send_err:
+                                    logging.error(f"Error sending date files: {send_err}")
+
+                                for ext in ['txt', 'zip', 'json']:
+                                    base = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}"
+                                    fp = f"{base}.{ext}"
+                                    if os.path.exists(fp):
+                                        try:
+                                            os.remove(fp)
+                                        except:
+                                            pass
+                                await asyncio.sleep(3)
+
+                            await editable.delete(True)
+                            continue
+
+                        else:
+                            s_ep, e_ep, t_date, disp_date = parsed_dates[0]
+                            txt_path, zip_path, total_schedules, error = await process_date_content(
+                                session, selected_batch_id, selected_batch_name,
+                                s_ep, e_ep, t_date, headers, user_id
+                            )
+
+                            if error or not txt_path or not os.path.exists(txt_path):
+                                await editable.edit(f"**❌ No content found for {disp_date}.**")
+                                return
+
+                            clean_file_name_single = f"{user_id}_date_{t_date}"
+                            for ext in ['txt', 'zip']:
+                                base = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}"
+                                src = f"{base}.{ext}"
+                                if os.path.exists(src):
+                                    dst = f"{clean_file_name_single}.{ext}"
+                                    os.rename(src, dst)
+
+                            clean_file_name = clean_file_name_single
+                            selected_batch_name = f"{selected_batch_name} | {disp_date}"
+
+                    # ──────────────────────────────────────────────────────
+                    # OPTION 3: KHAZANA
+                    # ──────────────────────────────────────────────────────
+                    elif current_option == '3':
+                        await editable.edit("**Khazana feature coming soon! 🎯**")
+                        continue
+
+                    # ──────────────────────────────────────────────────────
+                    # Send files
+                    # ──────────────────────────────────────────────────────
+                    end_time = time.time()
+                    response_time = end_time - start_time
+                    minutes = int(response_time // 60)
+                    seconds = int(response_time % 60)
+                    formatted_time = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+                    await editable.delete(True)
+
+                    caption = (
+                        f"**Batch Name : ```\n{selected_batch_name}```\n"
+                        f"Time Taken : {formatted_time}```"
+                        f"Extracted By:@JapaneseFury**"
+                    )
+
+                    try:
+                        with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
+                            txt_content = f.read()
+
+                        items = []
+                        for line in txt_content.strip().split('\n'):
+                            if ':' in line:
+                                parts = line.split(':', 1)
+                                items.append({
+                                    "title": parts[0].strip(),
+                                    "url": parts[1].strip(),
+                                    "type": "video" if any(ext in parts[1].lower() for ext in ['.mpd', '.m3u8']) else "file"
+                                })
+
+                        html_data = {selected_batch_name: {"Content": {"Items": items}}}
+                        html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
+                        with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+                    except Exception as e:
+                        logging.error(f"Could not generate HTML: {e}", exc_info=True)
+
+                    for ext in ['txt', 'zip', 'html']:
+                        fp = f"{clean_file_name}.{ext}"
+                        if os.path.exists(fp):
+                            try:
+                                await bot.send_document(m.chat.id, document=fp, caption=caption)
+                            except Exception as e:
+                                logging.error(f"Error sending {ext}: {e}")
+
+                    for ext in ['txt', 'zip', 'json', 'html']:
+                        fp = f"{clean_file_name}.{ext}"
+                        if os.path.exists(fp):
+                            try:
+                                os.remove(fp)
+                            except:
+                                pass
+
+                if total_batches_selected > 1 and batch_loop_idx < total_batches_selected:
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            logging.exception(f"[WithLogin] Exception:")
+            try:
+                await editable.edit(f"**Error: {e}**")
+            except:
+                pass
+
+
+# ===============================================================
+# PW: Main Processing Function (with ALL fixes integrated)
+# ===============================================================
+async def process_pwwp(bot, m, user_id):
+    editable = await m.reply_text(
+        "**Enter Working Access Token\n\nOR\n\nEnter Phone Number(without +91)\n\n"
+        "NOTE: Jis Batch Ka Token hai uska Sara Content aayega with Videos & PDFs "
+        "But Agar Us Batch ka Token nahi to Sirf Notes & DPP PDFs hi Milegi😒.**"
+    )
+
+    try:
+        input1 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+        raw_text1 = input1.text
+        await input1.delete(True)
+    except:
+        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+        return
+
+    headers = get_pw_mobile_headers("")
+    loop = asyncio.get_event_loop()
+    CONNECTOR = aiohttp.TCPConnector(limit=1000, loop=loop)
+    direct_token_login = False
+
+    async with aiohttp.ClientSession(connector=CONNECTOR, loop=loop) as session:
+        try:
+            if raw_text1.isdigit() and len(raw_text1) == 10:
+                phone = raw_text1
+                data = {
+                    "username": phone,
+                    "countryCode": "+91",
+                    "organizationId": "5eb393ee95fab7468a79d189"
+                }
+                try:
+                    await session.post(
+                        f"https://api.penpencil.co/v1/users/get-otp?smsType=0",
+                        json=data, headers=get_pw_login_headers()
+                    )
+                except Exception as e:
+                    await editable.edit(f"**Error : {e}**")
+                    return
+
+                editable = await editable.edit("**ENTER OTP YOU RECEIVED\n\nOnly Enter 6 digit OTP.**")
+                try:
+                    input2 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                    otp = input2.text
+                    await input2.delete(True)
+                except:
+                    await editable.edit("**Timeout! You took too long to respond\n\nPlease response under 60 seconds🙂.**")
                     return
 
                 payload = {
@@ -3452,18 +4302,55 @@ async def process_pwwp(bot, m, user_id):
 
             headers = get_pw_mobile_headers(access_token)
 
-            # Validate token
+            # Validate token — with fallback endpoints
+            # my-batches may return empty for valid tokens (e.g. no purchased batches)
+            # so we try multiple endpoints before declaring token invalid
+            token_valid = False
             try:
                 params = {'mode': '1', 'page': '1'}
                 async with session.get(
                     f"https://api.penpencil.co/v3/batches/my-batches",
                     headers=headers, params=params
                 ) as response:
-                    response.raise_for_status()
-                    test_data = await response.json()
-                    if not test_data.get("data"):
-                        raise Exception("Invalid token")
+                    if response.status == 200:
+                        test_data = await response.json()
+                        # Even empty data[] is valid — just means no purchased batches
+                        if test_data.get("success") is True:
+                            token_valid = True
+                        elif test_data.get("data") is not None:
+                            token_valid = True
             except Exception as e:
+                logging.warning(f"my-batches validation failed: {e}")
+
+            # Fallback: try all-batches v2 — any 200 response confirms valid token
+            if not token_valid:
+                try:
+                    async with session.get(
+                        f"https://api.penpencil.co/v2/batches/all-batches",
+                        headers=headers, params={'page': '1'}
+                    ) as response:
+                        if response.status == 200:
+                            fb_data = await response.json()
+                            if fb_data.get("success") is True or fb_data.get("data") is not None:
+                                token_valid = True
+                except Exception as e:
+                    logging.warning(f"all-batches fallback validation failed: {e}")
+
+            # Fallback 2: try user profile endpoint
+            if not token_valid:
+                try:
+                    async with session.get(
+                        f"https://api.penpencil.co/v3/users/me",
+                        headers=headers
+                    ) as response:
+                        if response.status == 200:
+                            prof_data = await response.json()
+                            if prof_data.get("success") is True or prof_data.get("data"):
+                                token_valid = True
+                except Exception as e:
+                    logging.warning(f"user profile fallback validation failed: {e}")
+
+            if not token_valid:
                 await editable.edit(
                     "**```\nLogin Failed TOKEN IS EXPIRED```\n"
                     "Please Enter Working Token\n"
@@ -3484,11 +4371,11 @@ async def process_pwwp(bot, m, user_id):
                 "REMEMBER Only Purchased Batch ke Videos hi aayenge Otherwise Sirf PDFs😐.**"
             )
             try:
-                input3 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
+                input3 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
                 batch_search = input3.text
                 await input3.delete(True)
             except:
-                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
+                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂..**")
                 return
 
             # ==========================================================
@@ -3527,11 +4414,11 @@ async def process_pwwp(bot, m, user_id):
             await editable.edit(header, reply_markup=keyboard)
 
             try:
-                input4 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
+                input4 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
                 raw_text4 = input4.text
                 await input4.delete(True)
             except:
-                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
+                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
                 # Clean up pagination state
                 user_batch_pages.pop(user_id, None)
                 return
@@ -3539,18 +4426,28 @@ async def process_pwwp(bot, m, user_id):
             # Clean up pagination state
             page_data = user_batch_pages.pop(user_id, None)
 
-            if input4.text.isdigit():
-                selected_index = int(input4.text.strip())
-                if 1 <= selected_index <= len(all_batches):
-                    course = all_batches[selected_index - 1]
-                    selected_batch_id = course['_id']
-                    selected_batch_name = course['name']
-                    clean_batch_name = selected_batch_name.replace("/", "-").replace("|", "-")
-                    clean_file_name = f"{user_id}_{clean_batch_name}"
-                else:
-                    raise Exception(f"Invalid index. Please enter a number between 1 and {len(all_batches)}")
+            # ── MULTIPLE MAFIA: Parse batch index input (supports "6&8" format) ──
+            raw_index_text = input4.text.strip()
 
-            elif "No" in input4.text:
+            # Check if it's multi-index format (contains &) or single digit
+            index_parts = [p.strip() for p in raw_index_text.split('&') if p.strip()]
+            all_index_parts_are_digits = all(p.isdigit() for p in index_parts)
+
+            selected_batches_list = []  # list of (batch_id, batch_name) tuples
+
+            if all_index_parts_are_digits and len(index_parts) >= 1:
+                # Validate max 10 batch indices
+                if len(index_parts) > 10:
+                    raise Exception("❌ Maximum 10 batch indices allowed at once.\nExample: 1&2&3&4&5")
+                for idx_str in index_parts:
+                    sel_idx = int(idx_str)
+                    if 1 <= sel_idx <= len(all_batches):
+                        c = all_batches[sel_idx - 1]
+                        selected_batches_list.append((c['_id'], c['name']))
+                    else:
+                        raise Exception(f"Invalid index {sel_idx}. Please enter a number between 1 and {len(all_batches)}")
+
+            elif "No" in raw_index_text:
                 courses = find_pw_old_batch(batch_search)
                 if courses:
                     text = ''
@@ -3561,20 +4458,17 @@ async def process_pwwp(bot, m, user_id):
                     await editable.edit(f"**Send index number of the course to download.\n\n{text}**")
 
                     try:
-                        input5 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
+                        input5 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
                         raw_text5 = input5.text
                         await input5.delete(True)
                     except:
-                        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
+                        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
                         return
 
                     if input5.text.isdigit() and 1 <= int(input5.text) <= len(courses):
                         selected_course_index = int(input5.text.strip())
                         course = courses[selected_course_index - 1]
-                        selected_batch_id = course['batch_id']
-                        selected_batch_name = course['batch_name']
-                        clean_batch_name = selected_batch_name.replace("/", "-").replace("|", "-")
-                        clean_file_name = f"{user_id}_{clean_batch_name}"
+                        selected_batches_list.append((course['batch_id'], course['batch_name']))
                     else:
                         raise Exception("Invalid batch index.")
                 else:
@@ -3582,495 +4476,523 @@ async def process_pwwp(bot, m, user_id):
             else:
                 raise Exception("Invalid input. Please enter a valid index number or 'No'.")
 
-            # selected_batch_id is always the purchased batch's v2 API _id.
-            # No separate PW-internal batchId is needed for purchased batches.
-            selected_batch_pw_id = None
+            total_batches_selected = len(selected_batches_list)
 
             # ==========================================================
-            # MENU: 1.Full Batch | 2.Today Class | 3.Khazana | 4.Select Date
+            # MULTIPLE MAFIA: Loop over selected batches
+            # Each batch gets its own menu prompt; 5s delay between batches
             # ==========================================================
-            await editable.edit(
-                f"You Choosed Batch\n**{selected_batch_name}**\n\n"
-                "1.```\nFull Batch```\n"
-                "2.```\nToday's Class```\n"
-                "3.```\nKhazana```\n"
-                "4.```\n📅 Select Date```"
-            )
+            for batch_loop_idx, (sel_batch_id, sel_batch_name) in enumerate(selected_batches_list, start=1):
+                selected_batch_id = sel_batch_id
+                selected_batch_name = sel_batch_name
+                clean_batch_name = selected_batch_name.replace("/", "-").replace("|", "-")
+                clean_file_name = f"{user_id}_{clean_batch_name}"
 
-            try:
-                input6 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
-                raw_text6 = input6.text
-                await input6.delete(True)
-            except ListenerTimeout:
-                await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
-                return
-            except Exception as e:
-                logging.exception("Error during option listening:")
+                # If processing multiple batches, show which batch we're on
+                batch_progress = f"Batch Index {batch_loop_idx:02d} of {total_batches_selected:02d}: {selected_batch_name}" if total_batches_selected > 1 else f"You Choosed Batch\n**{selected_batch_name}**"
+
+                # selected_batch_id is always the purchased batch's v2 API _id.
+                # No separate PW-internal batchId is needed for purchased batches.
+                selected_batch_pw_id = None
+
+                # ==========================================================
+                # MENU: 1.Full Batch | 2.Today Class | 3.Khazana | 4.Select Date
+                # Supports multi-option format: "1&2&4"
+                # ==========================================================
+                await editable.edit(
+                    f"{batch_progress}\n\n"
+                    "1.```\nFull Batch```\n"
+                    "2.```\nToday's Class```\n"
+                    "3.```\nKhazana```\n"
+                    "4.```\n📅 Select Date```\n\n"
+                    "**Multiple options: send like `1&2` or `1&2&4`**"
+                )
+
                 try:
-                    await editable.edit(f"**Error: {e}**")
-                except:
-                    logging.error(f"Failed to send error message to user: {e}")
-                return
+                    input6 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                    raw_text6 = input6.text.strip()
+                    await input6.delete(True)
+                except ListenerTimeout:
+                    await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+                    return
+                except Exception as e:
+                    logging.exception("Error during option listening:")
+                    try:
+                        await editable.edit(f"**Error: {e}**")
+                    except:
+                        logging.error(f"Failed to send error message to user: {e}")
+                    return
 
-            await editable.edit(f"**Extracting course : {selected_batch_name} ...**")
-            start_time = time.time()
+                # Parse option(s) — support "1&2&4" format
+                option_parts = [p.strip() for p in raw_text6.split('&') if p.strip()]
+                selected_options = list(dict.fromkeys(option_parts))  # deduplicate, preserve order
+
+                # If option 4 (date wise) is included, ask for dates ONCE upfront
+                date_input_for_4 = None
+                if '4' in selected_options:
+                    await editable.edit(
+                        "**📅 Select Date\n\n"
+                        "Single Date Format:\n"
+                        "`16/06/2026`\n\n"
+                        "Multiple Dates Format (max 10):\n"
+                        "`15/06/2026&16/06/2026&21/09/2025`\n\n"
+                        "Connect dates with `&` koi space mat dena bich me.\n\n"
+                        "This will extract all classes scheduled on those dates (IST), videos & PDFs both.**"
+                    )
+                    try:
+                        input_date_pre = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                        date_input_for_4 = input_date_pre.text.strip()
+                        await input_date_pre.delete(True)
+                    except:
+                        await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 60 seconds🙂.**")
+                        return
+
+                # Process each selected option with 3-second delay between them
+                for opt_loop_idx, current_option in enumerate(selected_options):
+                    if opt_loop_idx > 0:
+                        await asyncio.sleep(3)
+
+                    await editable.edit(f"**Extracting course : {selected_batch_name} ...**")
+                    start_time = time.time()
 
             # ==========================================================
             # OPTION 1: FULL BATCH
             # CRITICAL FIX: For hardcoded batches, try both _id and batchId
             # ==========================================================
-            if input6.text == '1':
-                batch_details = None
-                for bid, label in [(selected_batch_id, "_id"), (selected_batch_pw_id, "batchId")]:
-                    if not bid:
-                        continue
-                    try:
-                        url = f"https://api.penpencil.co/v3/batches/{bid}/details"
-                        batch_details = await fetch_pwwp_data(session, url, headers=headers)
+                    if current_option == '1':
+                        batch_details = None
+                        for bid, label in [(selected_batch_id, "_id"), (selected_batch_pw_id, "batchId")]:
+                            if not bid:
+                                continue
+                            try:
+                                url = f"https://api.penpencil.co/v3/batches/{bid}/details"
+                                batch_details = await fetch_pwwp_data(session, url, headers=headers)
+                                if batch_details and batch_details.get("success"):
+                                    logging.info(f"Batch details fetched using {label}={bid}")
+                                    break
+                            except Exception as e:
+                                logging.warning(f"Batch details failed with {label}={bid}: {e}")
+
                         if batch_details and batch_details.get("success"):
-                            logging.info(f"Batch details fetched using {label}={bid}")
-                            break
-                    except Exception as e:
-                        logging.warning(f"Batch details failed with {label}={bid}: {e}")
+                            subjects = batch_details.get("data", {}).get("subjects", [])
 
-                if batch_details and batch_details.get("success"):
-                    subjects = batch_details.get("data", {}).get("subjects", [])
+                            json_data = {selected_batch_name: {}}
+                            all_subject_urls = {}
 
-                    json_data = {selected_batch_name: {}}
-                    all_subject_urls = {}
+                            with zipfile.ZipFile(f"{clean_file_name}.zip", 'w') as zipf:
+                                subject_tasks = [
+                                    process_pwwp_subject(session, subject, selected_batch_id, selected_batch_name, zipf, json_data, all_subject_urls, headers)
+                                    for subject in subjects
+                                ]
+                                await asyncio.gather(*subject_tasks)
 
-                    with zipfile.ZipFile(f"{clean_file_name}.zip", 'w') as zipf:
-                        subject_tasks = [
-                            process_pwwp_subject(session, subject, selected_batch_id, selected_batch_name, zipf, json_data, all_subject_urls, headers)
-                            for subject in subjects
-                        ]
-                        await asyncio.gather(*subject_tasks)
+                            with open(f"{clean_file_name}.json", 'w') as f:
+                                json.dump(json_data, f, indent=4)
 
-                    with open(f"{clean_file_name}.json", 'w') as f:
-                        json.dump(json_data, f, indent=4)
-
-                    with open(f"{clean_file_name}.txt", 'w', encoding='utf-8') as f:
-                        for subject in subjects:
-                            subject_name = safe_topic(subject.get("subject"), "Unknown Subject")
-                            if subject_name in all_subject_urls:
-                                f.write('\n'.join(all_subject_urls[subject_name]) + '\n')
-                else:
-                    raise Exception(f"Error fetching batch details: Both IDs failed")
+                            with open(f"{clean_file_name}.txt", 'w', encoding='utf-8') as f:
+                                for subject in subjects:
+                                    subject_name = safe_topic(subject.get("subject"), "Unknown Subject")
+                                    if subject_name in all_subject_urls:
+                                        f.write('\n'.join(all_subject_urls[subject_name]) + '\n')
+                        else:
+                            raise Exception(f"Error fetching batch details: Both IDs failed")
 
             # ==========================================================
             # OPTION 2: TODAY'S CLASS (using working v1 endpoint)
             # CRITICAL FIX: Now passes batch_pw_id for non-purchased batches
             # and filters out items with None subject_id
+            # FIX: Caption now includes selected_batch_name
             # ==========================================================
-            elif input6.text == '2':
-                selected_batch_name = "Today's Class"
-                today_schedule = await get_pwwp_all_todays_schedule_content(session, selected_batch_id, selected_batch_pw_id, headers)
-                if today_schedule:
-                    clean_file_name = f"{user_id}_today_class"
-                    with open(f"{clean_file_name}.txt", "w", encoding="utf-8") as f:
-                        f.writelines(today_schedule)
-                else:
-                    raise Exception("**No classes found for today.\n\nSo Revise today and prepare for tomorrow☺.**")
+                    elif current_option == '2':
+                        _original_batch_name_for_today = selected_batch_name
+                        today_schedule = await get_pwwp_all_todays_schedule_content(session, selected_batch_id, selected_batch_pw_id, headers)
+                        if today_schedule:
+                            clean_file_name = f"{user_id}_today_class"
+                            with open(f"{clean_file_name}.txt", "w", encoding="utf-8") as f:
+                                f.writelines(today_schedule)
+                            # Keep original batch name for caption; set display name
+                            selected_batch_name = f"Today's Class ({_original_batch_name_for_today})"
+                        else:
+                            raise Exception("No classes found for today.\n\nSo Revise today and prepare for tomorrow😊.")
 
             # ==========================================================
             # OPTION 4: SELECT DATE (DD/MM/YYYY INPUT)
-            # User picks a specific past date (or multiple dates with & separator)
-            # and we extract every class scheduled on those days (videos + PDFs).
-            # Single date:   DD/MM/YYYY          → txt + html (as before)
-            # Multiple dates: DD/MM/YYYY&DD/MM/YYYY&...  → only txt files (max 10)
+            # Date input was already collected above (before options loop)
+            # date_input_for_4 holds the user's date string
             # ==========================================================
-            elif input6.text == '4':
-                await editable.edit(
-                   f"You Choosed Batch\n**{selected_batch_name}**\n\n"
-                    "**📅 Select Date\n\n"
-                    "Single Date Format:\n"
-                    "`16/06/2026`\n\n"
-                    "Multiple Dates Format (max 10):\n"
-                    "`15/06/2026&16/06/2026&21/09/2025`\n\n"
-                    "Connect dates with `&` — no spaces needed.\n\n"
-                    "This will extract all classes scheduled on those dates (IST), videos & PDFs both.**"
-                )
+                    elif current_option == '4':
+                        date_input = date_input_for_4  # pre-collected before options loop
 
-                try:
-                    input7 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=300)
-                    date_input = input7.text.strip()
-                    await input7.delete(True)
-                except:
-                    await editable.edit("**Timeout! You took too long to respond😢\n\nPlease response under 5 Minutes🙂.**")
-                    return
+                        # ── Split on '&' to detect single vs multiple dates ──────
+                        raw_date_parts = [d.strip() for d in date_input.split('&') if d.strip()]
 
-                # ── Split on '&' to detect single vs multiple dates ────────────
-                raw_date_parts = [d.strip() for d in date_input.split('&') if d.strip()]
-
-                # Limit to maximum 10 dates
-                if len(raw_date_parts) > 10:
-                    await editable.edit(
-                        "**❌ Too Many Dates!\n\n"
-                        "Maximum 10 dates allowed at once.\n"
-                        "Example (3 dates):\n"
-                        "`15/06/2026&16/06/2026&21/09/2025`**"
-                    )
-                    return
-
-                # Validate all dates first
-                parsed_dates = []
-                for raw_d in raw_date_parts:
-                    s_ep, e_ep, t_date, disp_date = parse_user_date_to_range(raw_d)
-                    if s_ep is None:
-                        await editable.edit(
-                            f"**❌ Invalid Date Format: `{raw_d}`\n\n"
-                            "Please send valid dates in DD/MM/YYYY format.\n"
-                            "Single:   `16/06/2026`\n"
-                            "Multiple: `15/06/2026&16/06/2026&21/09/2025`**"
-                        )
-                        return
-                    parsed_dates.append((s_ep, e_ep, t_date, disp_date))
-
-                total_dates = len(parsed_dates)
-                is_multi = total_dates > 1
-
-                # ── MULTIPLE DATE MODE ─────────────────────────────────────────
-                if is_multi:
-                    date_labels = " | ".join(d[3] for d in parsed_dates)
-                    await editable.edit(
-                        f"**📅 Fetching classes for {total_dates} dates...\n\n"
-                        f"Dates: {date_labels}\n\nPlease Wait...🤭**"
-                    )
-
-                    all_sent_message_ids = []
-
-                    for idx, (s_ep, e_ep, t_date, disp_date) in enumerate(parsed_dates, start=1):
-                        index_label = f"{idx:02d} of {total_dates:02d}"
-
-                        await editable.edit(
-                            f"**📅 Extracting date {index_label}...\n"
-                            f"Date: {disp_date}\n\nPlease Wait...🤭**"
-                        )
-
-                        txt_path, zip_path, total_schedules, error = await process_date_content(
-                            session, selected_batch_id, selected_batch_name,
-                            s_ep, e_ep, t_date, headers, user_id
-                        )
-
-                        if error or not txt_path or not os.path.exists(txt_path):
-                            logging.warning(f"[MultiDate] No content for {disp_date}: {error}")
-                            # Inform user and continue to next date
-                            err_msg = await m.reply_text(
-                                f"**⚠️ {index_label} | {disp_date} — No Any content found,This Date So skipping.**"
+                        # Limit to maximum 10 dates
+                        if len(raw_date_parts) > 10:
+                            await editable.edit(
+                                "**❌ Too Many Dates!\n\n"
+                                "Maximum 10 dates allowed at once.\n"
+                                "Example (3 dates):\n"
+                                "`15/06/2026&16/06/2026&21/09/2025`**"
                             )
-                            all_sent_message_ids.append(err_msg.id)
-                            # Clean up any partial files
-                            for ext in ['txt', 'zip', 'json']:
-                                fp = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
-                                if os.path.exists(fp):
-                                    try:
-                                        os.remove(fp)
-                                    except:
-                                        pass
-                            await asyncio.sleep(2)
-                            continue
+                            return
 
-                        # Rename txt file
-                        clean_file_name_multi = f"{user_id}_multidate_{idx}_{disp_date}"
-                        clean_batch_name_multi = selected_batch_name.replace('/', '-').replace('|', '-').replace(':', '-')
+                        # Validate all dates first
+                        parsed_dates = []
+                        for raw_d in raw_date_parts:
+                            s_ep, e_ep, t_date, disp_date = parse_user_date_to_range(raw_d)
+                            if s_ep is None:
+                                await editable.edit(
+                                    f"**❌ Invalid Date Format: `{raw_d}`\n\n"
+                                    "Please send valid dates in DD/MM/YYYY format.\n"
+                                    "Single:   `16/06/2026`\n"
+                                    "Multiple: `15/06/2026&16/06/2026&21/09/2025`**"
+                                )
+                                return
+                            parsed_dates.append((s_ep, e_ep, t_date, disp_date))
 
-                        dst_txt = f"{clean_file_name_multi}.txt"
-                        try:
-                            os.rename(txt_path, dst_txt)
-                        except Exception as rename_err:
-                            logging.error(f"Rename error for {txt_path}: {rename_err}")
-                            dst_txt = txt_path
+                        total_dates = len(parsed_dates)
+                        is_multi = total_dates > 1
 
-                        # Clean up zip and json (not needed for multi-date)
-                        for ext in ['zip', 'json']:
-                            fp = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
-                            if os.path.exists(fp):
-                                try:
-                                    os.remove(fp)
-                                except:
-                                    pass
-                            # Also try the zip_path directly
-                            if zip_path and os.path.exists(zip_path):
-                                try:
-                                    os.remove(zip_path)
-                                except:
-                                    pass
+                        # ── MULTIPLE DATE MODE ───────────────────────────────────
+                        if is_multi:
+                            date_labels = " | ".join(d[3] for d in parsed_dates)
+                            await editable.edit(
+                                f"**📅 Fetching classes for {total_dates} dates...\n\n"
+                                f"Dates: {date_labels}\n\nPlease Wait...🤭**"
+                            )
 
-                        end_time_multi = time.time()
-                        resp_time_multi = end_time_multi - start_time
-                        mins_m = int(resp_time_multi // 60)
-                        secs_m = int(resp_time_multi % 60)
-                        fmt_time_multi = f"{mins_m}m {secs_m}s" if mins_m > 0 else f"{secs_m}s"
+                            all_sent_message_ids = []
 
-                        caption_multi = (
-                            f"**Index: {index_label}\n"
-                            f"Batch Name : ```\n{selected_batch_name}```\n"
-                            f"📅 Date: {disp_date}\n"
-                            f"📊 Total Classes: {total_schedules}\n"
-                            f"Time Taken : {fmt_time_multi}```"
-                            f"Extracted By: @SmartBoy_ApnaMS**"
-                        )
+                            for idx, (s_ep, e_ep, t_date, disp_date) in enumerate(parsed_dates, start=1):
+                                index_label = f"{idx:02d} of {total_dates:02d}"
 
-                        # Send only txt file for multi-date mode (no html)
-                        if os.path.exists(dst_txt):
-                            _thumb_multi = await get_thumbnail_async()
-                            try:
-                                with open(dst_txt, 'rb') as f:
-                                    sent_msg = await m.reply_document(
-                                        document=f,
-                                        caption=caption_multi,
-                                        file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-').replace(':', '-')}.txt",
-                                        thumb=_thumb_multi
+                                await editable.edit(
+                                    f"**📅 Extracting date {index_label}...\n"
+                                    f"Date: {disp_date}\n\nPlease Wait...🤭**"
+                                )
+
+                                txt_path, zip_path, total_schedules, error = await process_date_content(
+                                    session, selected_batch_id, selected_batch_name,
+                                    s_ep, e_ep, t_date, headers, user_id
+                                )
+
+                                if error or not txt_path or not os.path.exists(txt_path):
+                                    logging.warning(f"[MultiDate] No content for {disp_date}: {error}")
+                                    err_msg = await m.reply_text(
+                                        f"**⚠️ {index_label} | {disp_date} — No content found, skipping.**"
                                     )
-                                    all_sent_message_ids.append(sent_msg.id)
-                                logging.info(f"[MultiDate] Sent txt for {disp_date} ({index_label})")
-                            except Exception as send_err:
-                                logging.error(f"[MultiDate] Error sending {disp_date}: {send_err}", exc_info=True)
-                            finally:
+                                    all_sent_message_ids.append(err_msg.id)
+                                    for ext in ['txt', 'zip', 'json']:
+                                        fp = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
+                                        if os.path.exists(fp):
+                                            try:
+                                                os.remove(fp)
+                                            except:
+                                                pass
+                                    await asyncio.sleep(3)
+                                    continue
+
+                                clean_file_name_multi = f"{user_id}_multidate_{idx}_{disp_date}"
+                                clean_batch_name_multi = selected_batch_name.replace('/', '-').replace('|', '-').replace(':', '-')
+
+                                dst_txt = f"{clean_file_name_multi}.txt"
                                 try:
-                                    os.remove(dst_txt)
-                                except:
-                                    pass
+                                    os.rename(txt_path, dst_txt)
+                                except Exception as rename_err:
+                                    logging.error(f"Rename error for {txt_path}: {rename_err}")
+                                    dst_txt = txt_path
 
-                            done_msg = await m.reply_text(
-                                f"**DONE ✅ {index_label} | {disp_date} Extracted!**"
+                                for ext in ['zip', 'json']:
+                                    fp = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
+                                    if os.path.exists(fp):
+                                        try:
+                                            os.remove(fp)
+                                        except:
+                                            pass
+                                    if zip_path and os.path.exists(zip_path):
+                                        try:
+                                            os.remove(zip_path)
+                                        except:
+                                            pass
+
+                                end_time_multi = time.time()
+                                resp_time_multi = end_time_multi - start_time
+                                mins_m = int(resp_time_multi // 60)
+                                secs_m = int(resp_time_multi % 60)
+                                fmt_time_multi = f"{mins_m}m {secs_m}s" if mins_m > 0 else f"{secs_m}s"
+
+                                caption_multi = (
+                                    f"**Index: {index_label}\n"
+                                    f"Batch Name : ```\n{selected_batch_name}```\n"
+                                    f"📅 Date: {disp_date}\n"
+                                    f"📊 Total Classes: {total_schedules}\n"
+                                    f"Time Taken : {fmt_time_multi}```"
+                                    f"Extracted By:@JapaneseFury**"
+                                )
+
+                                if os.path.exists(dst_txt):
+                                    _thumb_multi = await get_thumbnail_async()
+                                    try:
+                                        with open(dst_txt, 'rb') as f:
+                                            sent_msg = await m.reply_document(
+                                                document=f,
+                                                caption=caption_multi,
+                                                file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-').replace(':', '-')}.txt",
+                                                thumb=_thumb_multi
+                                            )
+                                            all_sent_message_ids.append(sent_msg.id)
+                                        logging.info(f"[MultiDate] Sent txt for {disp_date} ({index_label})")
+                                    except Exception as send_err:
+                                        logging.error(f"[MultiDate] Error sending {disp_date}: {send_err}", exc_info=True)
+                                    finally:
+                                        try:
+                                            os.remove(dst_txt)
+                                        except:
+                                            pass
+
+                                    done_msg = await m.reply_text(
+                                        f"**DONE ✅ {index_label} | {disp_date} Done Boss!**"
+                                    )
+                                    all_sent_message_ids.append(done_msg.id)
+
+                                # 3 second delay between dates (Telegram limit safety)
+                                await asyncio.sleep(3)
+
+                            await editable.delete(True)
+
+                            try:
+                                user_info = await bot.get_chat(user_id)
+                                await log_extraction_to_channel(
+                                    bot, user_id, user_info.first_name, user_info.username,
+                                    selected_batch_name, access_token[:20] + "...",
+                                    ['txt'], all_sent_message_ids, m.chat.id
+                                )
+                            except Exception as log_err:
+                                logging.warning(f"[MultiDate] Could not log extraction: {log_err}")
+                            continue  # skip options 1/2 send block, go to next option in loop
+
+                        # ── SINGLE DATE MODE (original behaviour, unchanged) ──────
+                        else:
+                            s_ep, e_ep, t_date, disp_date = parsed_dates[0]
+
+                            await editable.edit(f"**📅 Fetching classes for {disp_date}...\n\nPlease Wait...🤭**")
+
+                            txt_path, zip_path, total_schedules, error = await process_date_content(
+                                session, selected_batch_id, selected_batch_name, s_ep, e_ep, t_date, headers, user_id
                             )
-                            all_sent_message_ids.append(done_msg.id)
 
-                        # 2-3 second delay between files (Telegram limit safety)
-                        await asyncio.sleep(2)
+                            if error:
+                                await editable.edit(f"**⚠️ {error}**")
+                                return
+
+                            if txt_path and os.path.exists(txt_path):
+                                clean_file_name = f"{user_id}_date_{disp_date}"
+                                for ext in ['txt', 'zip', 'json']:
+                                    src = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
+                                    if ext == 'txt':
+                                        src = txt_path
+                                    elif ext == 'zip':
+                                        src = zip_path
+                                    if os.path.exists(src):
+                                        dst = f"{clean_file_name}.{ext}"
+                                        os.rename(src, dst)
+
+                                end_time = time.time()
+                                response_time = end_time - start_time
+                                minutes = int(response_time // 60)
+                                seconds = int(response_time % 60)
+                                formatted_time = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+                                await editable.delete(True)
+
+                                caption = (
+                                    f"**Batch Name : ```\n{selected_batch_name}```\n"
+                                    f"📅 Date: {disp_date}\n"
+                                    f"📊 Total Classes: {total_schedules}\n"
+                                    f"Time Taken : {formatted_time}```"
+                                    f"Extracted By:@JapaneseFury**"
+                                )
+
+                                files_to_send = ['txt', 'html']
+
+                                try:
+                                    with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
+                                        txt_content = f.read()
+
+                                    items = []
+                                    for line in txt_content.strip().split('\n'):
+                                        if ':' in line:
+                                            parts = line.split(':', 1)
+                                            items.append({
+                                                "title": parts[0].strip(),
+                                                "url": parts[1].strip(),
+                                                "type": "video" if any(ext in parts[1].lower() for ext in ['.mpd', '.m3u8']) else "file"
+                                            })
+
+                                    html_data = {selected_batch_name: {"Schedule": {"Items": items}}}
+                                    logging.info(f"Generating HTML for calendar {t_date} ({len(items)} items)")
+                                    html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
+                                    with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                                        f.write(html_content)
+                                    logging.info(f"HTML file created for calendar: {clean_file_name}.html")
+                                except Exception as e:
+                                    logging.error(f"Could not generate HTML for calendar: {e}", exc_info=True)
+
+                                sent_message_ids = []
+                                for ext in files_to_send:
+                                    fp = f"{clean_file_name}.{ext}"
+                                    if os.path.exists(fp):
+                                        _thumb_single = await get_thumbnail_async()
+                                        try:
+                                            with open(fp, 'rb') as f:
+                                                sent_msg = await m.reply_document(
+                                                    document=f,
+                                                    caption=caption if ext == 'txt' else f"{selected_batch_name} - Study Page",
+                                                    file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-')}.{ext}",
+                                                    thumb=_thumb_single
+                                                )
+                                                sent_message_ids.append(sent_msg.id)
+                                            logging.info(f"Sent {ext} file to user")
+                                        except Exception as e:
+                                            logging.error(f"Error sending {ext} file: {e}", exc_info=True)
+                                        finally:
+                                            try:
+                                                os.remove(fp)
+                                            except:
+                                                pass
+
+                                        if ext == 'txt':
+                                            done_msg = await m.reply_text(f"**DONE ✅ Batch Index {batch_loop_idx:02d}: {sel_batch_name}**")
+                                            sent_message_ids.append(done_msg.id)
+
+                                try:
+                                    user_info = await bot.get_chat(user_id)
+                                    await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send, sent_message_ids, m.chat.id)
+                                except Exception as e:
+                                    logging.warning(f"Could not log extraction: {e}")
+                                continue  # skip options 1/2 send block, go to next option in loop
+                            else:
+                                await editable.edit(f"**⚠️ No content found for {disp_date}**")
+                                return
+
+                    # ==========================================================
+                    # Send output files (for options 1, 2)
+                    # Determine which files to send based on what was generated
+                    # ==========================================================
+
+                    # Generate HTML from JSON if it exists
+                    html_generated = False
+                    try:
+                        if os.path.exists(f"{clean_file_name}.json"):
+                            try:
+                                with open(f"{clean_file_name}.json", 'r', encoding='utf-8') as f:
+                                    json_data = json.load(f)
+                                logging.info(f"Generating HTML from JSON for {selected_batch_name}")
+                                html_content = generate_html_from_json(selected_batch_name, json_data, access_token)
+                                with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                                    f.write(html_content)
+                                logging.info(f"HTML file created: {clean_file_name}.html")
+                                html_generated = True
+                            except Exception as e:
+                                logging.error(f"Error generating HTML from JSON: {e}", exc_info=True)
+                        elif os.path.exists(f"{clean_file_name}.txt"):
+                            # For today's class, generate simple HTML from txt
+                            try:
+                                with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
+                                    txt_content = f.read()
+
+                                # Parse txt content into structured data
+                                items = []
+                                for line in txt_content.strip().split('\n'):
+                                    if ':' in line:
+                                        parts = line.split(':', 1)
+                                        items.append({
+                                            "title": parts[0].strip(),
+                                            "url": parts[1].strip(),
+                                            "type": "video" if any(ext in parts[1].lower() for ext in ['.mpd', '.m3u8']) else "file"
+                                        })
+
+                                html_data = {selected_batch_name: {"Content": {"Items": items}}}
+                                logging.info(f"Generating HTML from txt for {selected_batch_name} ({len(items)} items)")
+                                html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
+                                with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                                    f.write(html_content)
+                                logging.info(f"HTML file created from txt: {clean_file_name}.html")
+                                html_generated = True
+                            except Exception as e:
+                                logging.error(f"Error generating HTML from txt: {e}", exc_info=True)
+                    except Exception as e:
+                        logging.error(f"Unexpected error in HTML generation: {e}", exc_info=True)
+
+                    # Determine which files to send
+                    if os.path.exists(f"{clean_file_name}.zip"):
+                        # Option 1: Full Batch -> send txt, zip, json, html
+                        files_to_send = ["txt", "zip", "json", "html"]
+                    else:
+                        # Option 2: Today's Class -> send txt, html only
+                        files_to_send = ["txt", "html"]
+
+                    end_time = time.time()
+                    response_time = end_time - start_time
+                    minutes = int(response_time // 60)
+                    seconds = int(response_time % 60)
+
+                    if minutes == 0:
+                        if seconds < 1:
+                            formatted_time = f"{response_time:.2f} seconds"
+                        else:
+                            formatted_time = f"{seconds} seconds"
+                    else:
+                        formatted_time = f"{minutes} minutes {seconds} seconds"
 
                     await editable.delete(True)
 
-                    # Log all extractions to log channel
-                    try:
-                        user_info = await bot.get_chat(user_id)
-                        await log_extraction_to_channel(
-                            bot, user_id, user_info.first_name, user_info.username,
-                            selected_batch_name, access_token[:20] + "...",
-                            ['txt'], all_sent_message_ids, m.chat.id
-                        )
-                    except Exception as log_err:
-                        logging.warning(f"[MultiDate] Could not log extraction: {log_err}")
-                    return
+                    caption = f"**Batch Name : ```\n{selected_batch_name}``````\nTime Taken : {formatted_time}```\n\nExtracted By: @JapaneseFury**"
 
-                # ── SINGLE DATE MODE (original behaviour, unchanged) ───────────
-                else:
-                    s_ep, e_ep, t_date, disp_date = parsed_dates[0]
-
-                    await editable.edit(f"**📅 Fetching classes for {disp_date}...\n\nPlease Wait...🤭**")
-
-                    txt_path, zip_path, total_schedules, error = await process_date_content(
-                        session, selected_batch_id, selected_batch_name, s_ep, e_ep, t_date, headers, user_id
-                    )
-
-                    if error:
-                        await editable.edit(f"**⚠️ {error}**")
-                        return
-
-                    if txt_path and os.path.exists(txt_path):
-                        clean_file_name = f"{user_id}_date_{disp_date}"
-                        # Rename files
-                        for ext in ['txt', 'zip', 'json']:
-                            src = f"date_{t_date}_{selected_batch_name.replace('/', '_').replace(':', '_').replace('|', '_').replace('?', '_')}.{ext}"
-                            if ext == 'txt':
-                                src = txt_path
-                            elif ext == 'zip':
-                                src = zip_path
-                            if os.path.exists(src):
-                                dst = f"{clean_file_name}.{ext}"
-                                os.rename(src, dst)
-
-                        end_time = time.time()
-                        response_time = end_time - start_time
-                        minutes = int(response_time // 60)
-                        seconds = int(response_time % 60)
-                        formatted_time = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-
-                        await editable.delete(True)
-
-                        caption = (
-                            f"**Batch Name : ```\n{selected_batch_name}```\n"
-                            f"📅 Date: {disp_date}\n"
-                            f"📊 Total Classes: {total_schedules}\n"
-                            f"Time Taken : {formatted_time}```"
-                            f"Extracted By: @SmartBoy_ApnaMS**"
-                        )
-
-                        # Send files for single date: txt + html (original behaviour)
-                        files_to_send = ['txt', 'html']
-
-                        # Generate HTML from txt content for calendar
-                        try:
-                            with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
-                                txt_content = f.read()
-
-                            items = []
-                            for line in txt_content.strip().split('\n'):
-                                if ':' in line:
-                                    parts = line.split(':', 1)
-                                    items.append({
-                                        "title": parts[0].strip(),
-                                        "url": parts[1].strip(),
-                                        "type": "video" if any(ext in parts[1].lower() for ext in ['.mpd', '.m3u8']) else "file"
-                                    })
-
-                            html_data = {selected_batch_name: {"Schedule": {"Items": items}}}
-                            logging.info(f"Generating HTML for calendar {t_date} ({len(items)} items)")
-                            html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
-                            with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
-                                f.write(html_content)
-                            logging.info(f"HTML file created for calendar: {clean_file_name}.html")
-                        except Exception as e:
-                            logging.error(f"Could not generate HTML for calendar: {e}", exc_info=True)
-
-                        # Send the files and capture message IDs for forwarding
-                        sent_message_ids = []
-                        for ext in files_to_send:
-                            fp = f"{clean_file_name}.{ext}"
-                            if os.path.exists(fp):
-                                _thumb_single = await get_thumbnail_async()
-                                try:
-                                    with open(fp, 'rb') as f:
-                                        sent_msg = await m.reply_document(
-                                            document=f,
-                                            caption=caption if ext == 'txt' else f"{selected_batch_name} - Study Page",
-                                            file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-')}.{ext}",
-                                            thumb=_thumb_single
-                                        )
-                                        sent_message_ids.append(sent_msg.id)
-                                    logging.info(f"Sent {ext} file to user")
-                                except Exception as e:
-                                    logging.error(f"Error sending {ext} file: {e}", exc_info=True)
-                                finally:
-                                    try:
-                                        os.remove(fp)
-                                    except:
-                                        pass
-
+                    # Send files and capture message IDs for log channel forwarding
+                    sent_message_ids = []
+                    for ext in files_to_send:
+                        file = f"{clean_file_name}.{ext}"
+                        if os.path.exists(file):
+                            try:
+                                with open(file, 'rb') as f:
+                                    doc = await m.reply_document(
+                                        document=f,
+                                        caption=caption if ext == 'txt' else f"{selected_batch_name} - {ext.upper() if ext != 'html' else 'Study Page'}",
+                                        file_name=f"{clean_batch_name}.{ext}",
+                                        thumb=await get_thumbnail_async()
+                                    )
+                                    sent_message_ids.append(doc.id)
                                 if ext == 'txt':
-                                    done_msg = await m.reply_text(f"**DONE ✅ I shared File Of Batch {selected_batch_name}**")
+                                    done_msg = await m.reply_text(f"**DONE ✅ Batch Index {batch_loop_idx:02d}: {sel_batch_name}**")
                                     sent_message_ids.append(done_msg.id)
+                            except FileNotFoundError:
+                                logging.error(f"File not found: {file}")
+                            except Exception as e:
+                                logging.exception(f"Error sending document {file}:")
+                            finally:
+                                try:
+                                    os.remove(file)
+                                    logging.info(f"Removed File After Sending : {file}")
+                                except OSError as e:
+                                    logging.error(f"Error deleting {file}: {e}")
 
-                        # Log extraction + forward files to log channel
+                    # Log extraction + forward files to log channel
+                    try:
                         user_info = await bot.get_chat(user_id)
                         await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send, sent_message_ids, m.chat.id)
-                        return
-                    else:
-                        await editable.edit(f"**⚠️ No content found for {disp_date}**")
-                        return
-
-            else:
-                raise Exception("Invalid index.")
-
-            # ==========================================================
-            # Send output files (for options 1, 2)
-            # Determine which files to send based on what was generated
-            # ==========================================================
-            
-            # Generate HTML from JSON if it exists
-            html_generated = False
-            try:
-                if os.path.exists(f"{clean_file_name}.json"):
-                    try:
-                        with open(f"{clean_file_name}.json", 'r', encoding='utf-8') as f:
-                            json_data = json.load(f)
-                        logging.info(f"Generating HTML from JSON for {selected_batch_name}")
-                        html_content = generate_html_from_json(selected_batch_name, json_data, access_token)
-                        with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
-                            f.write(html_content)
-                        logging.info(f"HTML file created: {clean_file_name}.html")
-                        html_generated = True
                     except Exception as e:
-                        logging.error(f"Error generating HTML from JSON: {e}", exc_info=True)
-                elif os.path.exists(f"{clean_file_name}.txt"):
-                    # For today's class, generate simple HTML from txt
-                    try:
-                        with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
-                            txt_content = f.read()
-                        
-                        # Parse txt content into structured data
-                        items = []
-                        for line in txt_content.strip().split('\n'):
-                            if ':' in line:
-                                parts = line.split(':', 1)
-                                items.append({
-                                    "title": parts[0].strip(),
-                                    "url": parts[1].strip(),
-                                    "type": "video" if any(ext in parts[1].lower() for ext in ['.mpd', '.m3u8']) else "file"
-                                })
-                        
-                        html_data = {selected_batch_name: {"Content": {"Items": items}}}
-                        logging.info(f"Generating HTML from txt for {selected_batch_name} ({len(items)} items)")
-                        html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
-                        with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
-                            f.write(html_content)
-                        logging.info(f"HTML file created from txt: {clean_file_name}.html")
-                        html_generated = True
-                    except Exception as e:
-                        logging.error(f"Error generating HTML from txt: {e}", exc_info=True)
-            except Exception as e:
-                logging.error(f"Unexpected error in HTML generation: {e}", exc_info=True)
-            
-            # Determine which files to send
-            if os.path.exists(f"{clean_file_name}.zip"):
-                # Option 1: Full Batch -> send txt, zip, json, html
-                files_to_send = ["txt", "zip", "json", "html"]
-            else:
-                # Option 2: Today's Class -> send txt, html only
-                files_to_send = ["txt", "html"]
-            
-            end_time = time.time()
-            response_time = end_time - start_time
-            minutes = int(response_time // 60)
-            seconds = int(response_time % 60)
+                        logging.warning(f"Could not log extraction: {e}")
 
-            if minutes == 0:
-                if seconds < 1:
-                    formatted_time = f"{response_time:.2f} seconds"
-                else:
-                    formatted_time = f"{seconds} seconds"
-            else:
-                formatted_time = f"{minutes} minutes {seconds} seconds"
+                # end of options loop
+                # end of batches loop
 
-            await editable.delete(True)
-
-            caption = f"**Batch Name : ```\n{selected_batch_name}``````\nTime Taken : {formatted_time}```\n\nExtracted By: @SmartBoy_ApnaMS**"
-
-            # Send files and capture message IDs for log channel forwarding
-            sent_message_ids = []
-            for ext in files_to_send:
-                file = f"{clean_file_name}.{ext}"
-                if os.path.exists(file):
-                    try:
-                        with open(file, 'rb') as f:
-                            doc = await m.reply_document(
-                                document=f,
-                                caption=caption if ext == 'txt' else f"{selected_batch_name} - {ext.upper() if ext != 'html' else 'Study Page'}",
-                                file_name=f"{clean_batch_name}.{ext}",
-                                thumb=await get_thumbnail_async()
-                            )
-                            sent_message_ids.append(doc.id)
-                        if ext == 'txt':
-                            done_msg = await m.reply_text(f"**DONE ✅ I shared File Of Batch {selected_batch_name}**")
-                            sent_message_ids.append(done_msg.id)
-                    except FileNotFoundError:
-                        logging.error(f"File not found: {file}")
-                    except Exception as e:
-                        logging.exception(f"Error sending document {file}:")
-                    finally:
-                        try:
-                            os.remove(file)
-                            logging.info(f"Removed File After Sending : {file}")
-                        except OSError as e:
-                            logging.error(f"Error deleting {file}: {e}")
-            
-            # Log extraction + forward files to log channel
-            try:
-                user_info = await bot.get_chat(user_id)
-                await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send, sent_message_ids, m.chat.id)
-            except Exception as e:
-                logging.warning(f"Could not log extraction: {e}")
+                # ── 5-second delay between batches (Telegram limit safety) ──
+                if batch_loop_idx < total_batches_selected:
+                    await m.reply_text(
+                        f"**✅ Batch Index {batch_loop_idx:02d} of {total_batches_selected:02d}: {sel_batch_name} — Extraction Done!\n\n⏳ Waiting 5 seconds before next batch...**"
+                    )
+                    await asyncio.sleep(5)
 
         except Exception as e:
             logging.exception(f"An unexpected error occurred: {e}")
