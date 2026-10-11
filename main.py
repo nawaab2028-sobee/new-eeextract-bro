@@ -3528,16 +3528,16 @@ async def start(bot, message):
     _save_broadcast_users(broadcast_users)
     random_image_url = random.choice(image_list)
     keyboard = [
-        [
-            InlineKeyboardButton("WITH LOGIN 🚀", callback_data="pwwp_with_login"),
-            InlineKeyboardButton("WITHOUT LOGIN 🦋", callback_data="pwwp_without_login")
-        ],
-        [InlineKeyboardButton("😋Join Channel", url="https://t.me/teamcinderella")]
+        [InlineKeyboardButton("View Login ✨", callback_data="menu_with_login")],
+        [InlineKeyboardButton("Without Login 🤝", callback_data="menu_without_login")],
+        [InlineKeyboardButton("PW Zip/Json to Txt file 📄", callback_data="menu_zip_converter")],
+        [InlineKeyboardButton("Update Channel 🚀", url="https://t.me/TeamCinderella")],
+        [InlineKeyboardButton("Developer 🦋", url="https://t.me/SmartBoy_ApnaMS")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await message.reply_photo(
         photo=random_image_url,
-        caption="HABIBI PLEASE PRESS HERE🤓",
+        caption="**Welcome! Choose an option below to get started.**",
         quote=True,
         reply_markup=reply_markup
     )
@@ -3632,30 +3632,170 @@ async def broadusers_handler(client: Client, m: Message):
 
 
 # ===============================================================
-# BOT: PW Callback Handler
+# BOT: PW Callback Handlers — Menu System
 # ===============================================================
 def _run_async_in_thread(coro):
     """Helper to run async coroutine in ThreadPool"""
     asyncio.run(coro)
 
+COMING_SOON_PREMIUM_MSG = (
+    "**Sorry Dude 😎, this is not going public — it's only for my Premium Users.\n\n"
+    "Want to buy a Premium Subscription? Get access from the owner.\n\n"
+    "Owner ID: @SmartBoy_ApnaMS**"
+)
+
+def _back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")]])
+
+def _submenu_with_login_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Physics Wallah 🐻", callback_data="sub_with_login_pw")],
+        [InlineKeyboardButton("Class Plus 🐨", callback_data="sub_with_login_classplus")],
+        [InlineKeyboardButton("Appx 😋", callback_data="sub_with_login_appx")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")]
+    ])
+
+def _submenu_without_login_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Physics Wallah 🐻", callback_data="sub_without_login_pw")],
+        [InlineKeyboardButton("Class Plus 🐨", callback_data="sub_without_login_classplus")],
+        [InlineKeyboardButton("Appx 😋", callback_data="sub_without_login_appx")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")]
+    ])
+
+def _start_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("View Login ✨", callback_data="menu_with_login")],
+        [InlineKeyboardButton("Without Login 🤝", callback_data="menu_without_login")],
+        [InlineKeyboardButton("PW Zip/Json to Txt file 📄", callback_data="menu_zip_converter")],
+        [InlineKeyboardButton("Update Channel 🚀", url="https://t.me/TeamCinderella")],
+        [InlineKeyboardButton("Developer 🦋", url="https://t.me/SmartBoy_ApnaMS")]
+    ])
+
+
+# ── Back to main menu ──────────────────────────────────────────
+@bot.on_callback_query(filters.regex("^back_to_main$"))
+async def back_to_main_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text(
+            "**Welcome! Choose an option below to get started.**",
+            reply_markup=_start_keyboard()
+        )
+    except Exception:
+        pass
+
+
+# ── View Login ✨ → sub-menu ───────────────────────────────────
+@bot.on_callback_query(filters.regex("^menu_with_login$"))
+async def menu_with_login_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text(
+            "**View Login ✨\n\nSelect your platform below:**",
+            reply_markup=_submenu_with_login_keyboard()
+        )
+    except Exception:
+        pass
+
+
+# ── Without Login 🤝 → sub-menu ───────────────────────────────
+@bot.on_callback_query(filters.regex("^menu_without_login$"))
+async def menu_without_login_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text(
+            "**Without Login 🤝\n\nSelect your platform below:**",
+            reply_markup=_submenu_without_login_keyboard()
+        )
+    except Exception:
+        pass
+
+
+# ── WITH LOGIN → Physics Wallah 🐻 ────────────────────────────
+@bot.on_callback_query(filters.regex("^sub_with_login_pw$"))
+async def sub_with_login_pw_callback(bot, callback_query):
+    await callback_query.answer()
+    THREADPOOL.submit(_run_async_in_thread, process_pwwp_with_login(bot, callback_query.message, callback_query.from_user.id))
+
+
+# ── WITH LOGIN → Class Plus 🐨 ────────────────────────────────
+@bot.on_callback_query(filters.regex("^sub_with_login_classplus$"))
+async def sub_with_login_classplus_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text("**Coming Soon... 🥀**", reply_markup=_back_keyboard())
+    except Exception:
+        pass
+
+
+# ── WITH LOGIN → Appx 😋 ──────────────────────────────────────
+@bot.on_callback_query(filters.regex("^sub_with_login_appx$"))
+async def sub_with_login_appx_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text("**Coming Soon... 🥀**", reply_markup=_back_keyboard())
+    except Exception:
+        pass
+
+
+# ── WITHOUT LOGIN → Physics Wallah 🐻 ────────────────────────
+@bot.on_callback_query(filters.regex("^sub_without_login_pw$"))
+async def sub_without_login_pw_callback(bot, callback_query):
+    user_id = callback_query.from_user.id
+    await callback_query.answer()
+    if user_id not in auth_users:
+        try:
+            await callback_query.message.edit_text(COMING_SOON_PREMIUM_MSG, reply_markup=_back_keyboard())
+        except Exception:
+            pass
+        return
+    THREADPOOL.submit(_run_async_in_thread, process_pwwp(bot, callback_query.message, user_id))
+
+
+# ── WITHOUT LOGIN → Class Plus 🐨 ────────────────────────────
+@bot.on_callback_query(filters.regex("^sub_without_login_classplus$"))
+async def sub_without_login_classplus_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text(COMING_SOON_PREMIUM_MSG, reply_markup=_back_keyboard())
+    except Exception:
+        pass
+
+
+# ── WITHOUT LOGIN → Appx 😋 ──────────────────────────────────
+@bot.on_callback_query(filters.regex("^sub_without_login_appx$"))
+async def sub_without_login_appx_callback(bot, callback_query):
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_text(COMING_SOON_PREMIUM_MSG, reply_markup=_back_keyboard())
+    except Exception:
+        pass
+
+
+# ── PW Zip/Json to Txt file 📄 ───────────────────────────────
+@bot.on_callback_query(filters.regex("^menu_zip_converter$"))
+async def menu_zip_converter_callback(bot, callback_query):
+    user_id = callback_query.from_user.id
+    await callback_query.answer()
+    THREADPOOL.submit(_run_async_in_thread, process_zip_to_txt(bot, callback_query.message, user_id))
+
+
+# Legacy aliases — keep working if any old deep-link uses them
 @bot.on_callback_query(filters.regex("^pwwp_without_login$"))
 async def pwwp_without_login_callback(bot, callback_query):
     user_id = callback_query.from_user.id
     await callback_query.answer()
-
     if user_id not in auth_users:
-        await bot.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot\nSo DM me for access\nID: @JapaneseFury**")
+        await bot.send_message(callback_query.message.chat.id, COMING_SOON_PREMIUM_MSG)
         return
-
     THREADPOOL.submit(_run_async_in_thread, process_pwwp(bot, callback_query.message, user_id))
 
 
 @bot.on_callback_query(filters.regex("^pwwp_with_login$"))
 async def pwwp_with_login_callback(bot, callback_query):
-    user_id = callback_query.from_user.id
     await callback_query.answer()
-    # WITH LOGIN is free for all users — no auth_users check
-    THREADPOOL.submit(_run_async_in_thread, process_pwwp_with_login(bot, callback_query.message, user_id))
+    THREADPOOL.submit(_run_async_in_thread, process_pwwp_with_login(bot, callback_query.message, callback_query.from_user.id))
 
 
 # ===============================================================
@@ -3719,6 +3859,159 @@ async def batch_prev_callback(bot, callback_query):
 async def batch_page_info_callback(bot, callback_query):
     """Handle page info button click (does nothing, just info)"""
     await callback_query.answer("Use Previous/Next to navigate pages")
+
+
+# ===============================================================
+# ZIP/JSON → TXT Converter
+# Accepts .zip (with subject folders + txt files) or .json (PW format)
+# Outputs one txt file per subject, sent 1-by-1 with progress
+# ===============================================================
+async def process_zip_to_txt(bot, m, user_id):
+    editable = await m.reply_text(
+        "**📄 PW Zip / JSON → TXT Converter\n\n"
+        "Send your `.zip` or `.json` file now.\n\n"
+        "• ZIP: should contain subject folders with content files\n"
+        "• JSON: Physics Wallah batch JSON export\n\n"
+        "Timeout: 3 minutes.**"
+    )
+
+    try:
+        file_msg = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=180)
+    except:
+        await editable.edit("**Timeout! No file received.**")
+        return
+
+    doc = file_msg.document
+    if not doc:
+        await file_msg.delete(True)
+        await editable.edit("**Please send a valid .zip or .json file.**")
+        return
+
+    fname = doc.file_name or ""
+    if not (fname.lower().endswith(".zip") or fname.lower().endswith(".json")):
+        await file_msg.delete(True)
+        await editable.edit("**Unsupported file type. Please send a .zip or .json file.**")
+        return
+
+    await editable.edit("**Downloading your file... ⏳**")
+    local_path = f"/tmp/conv_{user_id}_{fname}"
+    try:
+        await file_msg.download(local_path)
+        await file_msg.delete(True)
+    except Exception as e:
+        await editable.edit(f"**Download failed: {e}**")
+        return
+
+    await editable.edit("**Processing file... 🔄**")
+
+    subject_data = {}  # subject_name -> list of lines
+
+    try:
+        if fname.lower().endswith(".json"):
+            with open(local_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            # PW JSON format: {batch_name: {subject_name: {topic: {videos:[...], notes:[...]}}}}
+            # Flatten all URLs per subject
+            for batch_name, batch_val in raw.items():
+                if not isinstance(batch_val, dict):
+                    continue
+                for subject_name, subject_val in batch_val.items():
+                    if subject_name in ("date", "total_schedules"):
+                        continue
+                    if not isinstance(subject_val, dict):
+                        continue
+                    lines = []
+                    for topic_key, topic_val in subject_val.items():
+                        if isinstance(topic_val, dict):
+                            for vline in topic_val.get("videos", []):
+                                if vline.strip():
+                                    lines.append(vline.strip())
+                            for nline in topic_val.get("notes", []):
+                                if nline.strip():
+                                    lines.append(nline.strip())
+                        elif isinstance(topic_val, list):
+                            for item in topic_val:
+                                if isinstance(item, str) and item.strip():
+                                    lines.append(item.strip())
+                    if lines:
+                        key = f"{batch_name} — {subject_name}"
+                        subject_data.setdefault(key, []).extend(lines)
+
+        elif fname.lower().endswith(".zip"):
+            import zipfile as _zf
+            with _zf.ZipFile(local_path, "r") as zf:
+                names = zf.namelist()
+                for entry in names:
+                    parts = entry.strip("/").split("/")
+                    if len(parts) < 2:
+                        continue
+                    subject_name = parts[0]
+                    # read text files inside subject folders
+                    if not entry.endswith("/"):
+                        try:
+                            content = zf.read(entry).decode("utf-8", errors="ignore")
+                            for line in content.splitlines():
+                                line = line.strip()
+                                if line:
+                                    subject_data.setdefault(subject_name, []).append(line)
+                        except Exception:
+                            pass
+
+    except Exception as e:
+        await editable.edit(f"**Failed to parse file: {e}**")
+        try:
+            os.remove(local_path)
+        except:
+            pass
+        return
+
+    try:
+        os.remove(local_path)
+    except:
+        pass
+
+    if not subject_data:
+        await editable.edit("**No content found in the file. Please check the file format.**")
+        return
+
+    subjects = list(subject_data.keys())
+    total = len(subjects)
+    await editable.edit(f"**Found {total} subject(s). Sending files... 📤**")
+
+    for idx, subject_name in enumerate(subjects, start=1):
+        lines = subject_data[subject_name]
+        # Deduplicate while preserving order
+        seen = set()
+        unique_lines = []
+        for l in lines:
+            if l not in seen:
+                seen.add(l)
+                unique_lines.append(l)
+
+        safe_name = subject_name.replace("/", "-").replace("|", "-").replace(":", "-").replace("?", "")
+        out_path = f"/tmp/conv_{user_id}_{idx}_{safe_name[:40]}.txt"
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(unique_lines))
+
+        caption = (
+            f"**📚 Subject {idx} of {total}**\n"
+            f"```\n{subject_name}```\n"
+            f"Total Links: {len(unique_lines)}\n"
+            f"Extracted By: @JapaneseFury"
+        )
+        try:
+            await bot.send_document(m.chat.id, document=out_path, caption=caption)
+        except Exception as e:
+            logging.error(f"Error sending subject file {subject_name}: {e}")
+        try:
+            os.remove(out_path)
+        except:
+            pass
+        if idx < total:
+            await asyncio.sleep(2)
+
+    await editable.edit(f"**✅ Done! Sent {total} subject file(s).**")
 
 
 # ===============================================================
@@ -4225,9 +4518,9 @@ async def process_pwwp_with_login(bot, m, user_id):
 # ===============================================================
 async def process_pwwp(bot, m, user_id):
     editable = await m.reply_text(
-        "**Enter Working Access Token\n\nOR\n\nEnter Phone Number(without +91)\n\n"
-        "NOTE: Jis Batch Ka Token hai uska Sara Content aayega with Videos & PDFs "
-        "But Agar Us Batch ka Token nahi to Sirf Notes & DPP PDFs hi Milegi😒.**"
+        "**Without Login 🤝 — Physics Wallah\n\n"
+        "Enter your Access Token\n\nOR\n\nEnter your Phone Number (without +91)\n\n"
+        "📌 Note: Only Class Notes & DPP PDFs will be extracted (no videos in without-login mode).**"
     )
 
     try:
@@ -4291,9 +4584,9 @@ async def process_pwwp(bot, m, user_id):
                             f"<b>✅Please Renew Token From: @pwextract_bot(New Duplicate token). </b>\n\n"
                             f"<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n"
                         )
-                        editable = await m.reply_text("**Getting ALL Batches...\n\nPlease Wait...🤭**")
+                        editable = await m.reply_text("**Fetching batches... Please wait. 🤭**")
                 except Exception as e:
-                    await editable.edit(f"**Error : {e}**")
+                    await editable.edit(f"**Error: {e}**")
                     return
 
             else:
@@ -4352,23 +4645,21 @@ async def process_pwwp(bot, m, user_id):
 
             if not token_valid:
                 await editable.edit(
-                    "**```\nLogin Failed TOKEN IS EXPIRED```\n"
-                    "Please Enter Working Token\n"
-                    "                       OR\n"
-                    "Login With Phone Number**"
+                    "**❌ Login Failed — Token is expired or invalid.\n\n"
+                    "Please enter a working token or login with your phone number.**"
                 )
                 return
 
             if direct_token_login:
                 await editable.edit(
-                    f"<b>✅Please Renew Token From: @pwextract_bot(New Duplicate token).</b>\n\n"
+                    f"<b>✅ Token verified! You can also renew it via @pwextract_bot.</b>\n\n"
                     f"<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n"
                 )
-                editable = await m.reply_text("**Getting ALL Batches...\n\nPlease Wait...🤭**")
+                editable = await m.reply_text("**Fetching batches... Please wait. 🤭**")
 
             await editable.edit(
-                "**Enter Your Batch Name\n\n"
-                "REMEMBER Only Purchased Batch ke Videos hi aayenge Otherwise Sirf PDFs😐.**"
+                "**Enter the Batch Name to search.\n\n"
+                "📌 Note: Only Class Notes & DPP PDFs will be extracted (without-login mode).**"
             )
             try:
                 input3 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
